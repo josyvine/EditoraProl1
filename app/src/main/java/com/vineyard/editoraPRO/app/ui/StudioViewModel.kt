@@ -2,7 +2,6 @@ package com.vineyard.editoraPRO.app.ui
 
 import android.app.Application
 import android.graphics.Bitmap
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.SystemClock
 import androidx.core.content.FileProvider
@@ -17,7 +16,6 @@ import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.data.model.MainTab
 import com.vineyard.editoraPRO.app.data.model.PcmAudioBuffer
 import com.vineyard.editoraPRO.app.data.model.ProcessMonitorState
-import com.vineyard.editoraPRO.app.data.model.ProcessStatus
 import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ReferenceBlueprint
 import com.vineyard.editoraPRO.app.data.model.ReferenceSourceType
@@ -27,7 +25,6 @@ import com.vineyard.editoraPRO.app.domain.media.BeatDetector
 import com.vineyard.editoraPRO.app.domain.media.FrameExtractor
 import com.vineyard.editoraPRO.app.domain.media.InspectionSheetBuilder
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -92,13 +89,37 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setWizardStep(step: Int) {
-        _uiState.update { it.copy(wizardStep = step.coerceIn(1, 3)) }
+        val target = step.coerceIn(1, 3)
+        _uiState.update { st ->
+            val nextSubStep = when {
+                target == 2 && st.wizardStep < 2 -> 1
+                target == 2 && st.wizardStep > 2 -> 2
+                else -> st.step2SubStep
+            }
+            st.copy(wizardStep = target, step2SubStep = nextSubStep)
+        }
+    }
+
+    fun setStep2SubStep(subStep: Int) {
+        _uiState.update { it.copy(step2SubStep = subStep.coerceIn(1, 2)) }
+    }
+
+    fun setSettingsSubPage(page: Int) {
+        _uiState.update { it.copy(settingsSubPage = page.coerceIn(1, 2)) }
     }
 
     fun handleBackPress(): Boolean {
         val st = _uiState.value
+        if (st.activeTab == MainTab.SETTINGS && st.settingsSubPage > 1) {
+            setSettingsSubPage(st.settingsSubPage - 1)
+            return true
+        }
         if (st.activeTab != MainTab.STUDIO) {
             setActiveTab(MainTab.STUDIO)
+            return true
+        }
+        if (st.wizardStep == 2 && st.step2SubStep > 1) {
+            setStep2SubStep(st.step2SubStep - 1)
             return true
         }
         if (st.wizardStep > 1) {
