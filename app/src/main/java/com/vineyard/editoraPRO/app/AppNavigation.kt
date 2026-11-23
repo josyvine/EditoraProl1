@@ -112,6 +112,15 @@ fun AppNavigation(
                     contentAlignment = Alignment.TopCenter
                 ) {
                     val scrollState = rememberScrollState()
+                    LaunchedEffect(
+                        state.activeTab,
+                        state.wizardStep,
+                        state.step2SubStep,
+                        state.settingsSubPage
+                    ) {
+                        scrollState.scrollTo(0)
+                    }
+
                     Column(
                         modifier = Modifier
                             .widthIn(max = 720.dp)
@@ -144,7 +153,8 @@ fun AppNavigation(
                                 onCancelStage3 = viewModel::cancelActiveProcess,
                                 onExportVideo = viewModel::exportVideo,
                                 onSaveToGallery = viewModel::saveExportedToGallery,
-                                onNavigateToSettings = { viewModel.setActiveTab(MainTab.SETTINGS) }
+                                onNavigateToSettings = { viewModel.setActiveTab(MainTab.SETTINGS) },
+                                onSelectStep2SubStep = viewModel::setStep2SubStep
                             )
                             MainTab.AI_LOGIC -> AiLogicScreen(
                                 state = state,
@@ -162,7 +172,8 @@ fun AppNavigation(
                                 onSelectModel = viewModel::selectModel,
                                 onSelectThinkingLevel = viewModel::setThinkingLevel,
                                 onSelectExportFps = viewModel::setExportFps,
-                                onSelectMaxCanvasEdge = viewModel::setMaxCanvasEdge
+                                onSelectMaxCanvasEdge = viewModel::setMaxCanvasEdge,
+                                onSelectSettingsPage = viewModel::setSettingsSubPage
                             )
                         }
                     }
