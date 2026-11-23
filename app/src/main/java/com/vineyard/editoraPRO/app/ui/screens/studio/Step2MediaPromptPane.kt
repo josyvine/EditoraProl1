@@ -112,7 +112,7 @@ fun Step2MediaPromptPane(
         Step2SubStepBar(
             currentSubStep = subStep,
             hasMedia = state.userClips.isNotEmpty() || state.customAudioName.isNotBlank(),
-            hasPromptOrBuild = state.extraNotes.trim().isNotEmpty() || state.activePipelineReady,
+            hasPromptOrBuild = state.extraNotes.trim().isNotEmpty() || state.isRenderReady,
             onSelectSubStep = onSelectStep2SubStep
         )
 
