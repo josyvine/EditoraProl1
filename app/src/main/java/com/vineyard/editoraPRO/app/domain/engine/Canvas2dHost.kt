@@ -168,6 +168,14 @@ class Canvas2dHost {
 
     fun getBitmap(handle: String): Bitmap? = getSurface(handle)?.bitmap
 
+    fun removeSurface(handle: String): Boolean {
+        val removed = surfaces.remove(handle) ?: return false
+        if (!removed.bitmap.isRecycled) {
+            removed.bitmap.recycle()
+        }
+        return true
+    }
+
     fun clearAllUserBuffers() {
         val it = surfaces.entries.iterator()
         while (it.hasNext()) {
