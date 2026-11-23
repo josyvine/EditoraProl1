@@ -68,6 +68,7 @@ fun StudioScreen(
     onExportVideo: () -> Unit,
     onSaveToGallery: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onSelectStep2SubStep: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -106,7 +107,8 @@ fun StudioScreen(
                 onCancelStage2 = onCancelStage2,
                 onPreviousStep = { onSelectWizardStep(1) },
                 onNextStep = { onSelectWizardStep(3) },
-                onNavigateToSettings = onNavigateToSettings
+                onNavigateToSettings = onNavigateToSettings,
+                onSelectStep2SubStep = onSelectStep2SubStep
             )
             else -> Step3ExportPane(
                 state = state,
