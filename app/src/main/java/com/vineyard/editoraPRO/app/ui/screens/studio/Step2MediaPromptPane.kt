@@ -59,6 +59,8 @@ import com.vineyard.editoraPRO.app.ui.components.StatusPill
 import com.vineyard.editoraPRO.app.ui.theme.EditoraAccent
 import com.vineyard.editoraPRO.app.ui.theme.EditoraAccentCyan
 import com.vineyard.editoraPRO.app.ui.theme.EditoraBorder
+import com.vineyard.editoraPRO.app.ui.theme.EditoraSuccessGreen
+import com.vineyard.editoraPRO.app.ui.theme.EditoraSurface
 import com.vineyard.editoraPRO.app.ui.theme.EditoraSurface2
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextMuted
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextPrimary
@@ -79,6 +81,7 @@ fun Step2MediaPromptPane(
     onPreviousStep: () -> Unit,
     onNextStep: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onSelectStep2SubStep: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val pickMediaLauncher = rememberLauncherForActivityResult(
@@ -100,213 +103,310 @@ fun Step2MediaPromptPane(
     val hasRef = state.refAnalysis != null
     val isRunning = state.stage2Monitor.status == ProcessStatus.RUNNING
     val canBuild = !isRunning && (state.userClips.isNotEmpty() || state.extraNotes.trim().isNotEmpty())
+    val subStep = state.step2SubStep.coerceIn(1, 2)
 
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        EditoraCard {
-            CardStepHeader(
-                stepNumber = "2",
-                title = "Your Media & AI Prompt",
-                pillText = "${state.userClips.size} item${if (state.userClips.size == 1) "" else "s"}",
-                pillTone = if (state.userClips.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
-                pillTag = "clips_badge"
-            )
+        Step2SubStepBar(
+            currentSubStep = subStep,
+            hasMedia = state.userClips.isNotEmpty() || state.customAudioName.isNotBlank(),
+            hasPromptOrBuild = state.extraNotes.trim().isNotEmpty() || state.activePipelineReady,
+            onSelectSubStep = onSelectStep2SubStep
+        )
 
-            Text(
-                text = if (hasRef) {
-                    "Upload 1 or many videos/images (including exact background/tile plates) and/or write an AI prompt. Your prompt always takes top priority alongside or without a reference."
-                } else {
-                    "Prompt/Media Mode (No Reference): Upload media or enter an animation/edit prompt to synthesize timeline & shader art directly."
-                },
-                color = EditoraTextMuted,
-                fontSize = 12.sp,
-                lineHeight = 17.sp
-            )
+        if (subStep == 1) {
+            // Sub-Page 1: Media Upload + Clips Grid + Custom Audio
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = "2",
+                    title = "Your Media & Audio",
+                    pillText = "${state.userClips.size} item${if (state.userClips.size == 1) "" else "s"}",
+                    pillTone = if (state.userClips.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
+                    pillTag = "clips_badge"
+                )
 
-            DashedUploadBox(
-                title = "Tap to Add Videos or Images (Optional for Pure Prompt)",
-                subtitle = "Single or multiple videos / photos / exact tile templates",
-                onClick = {
-                    pickMediaLauncher.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
-                    )
-                },
-                testTag = "user_media_upload_box"
-            )
+                Text(
+                    text = if (hasRef) {
+                        "Upload 1 or many videos/images (including exact background/tile plates) and optionally attach music. Tap Next to enter your AI prompt."
+                    } else {
+                        "Prompt/Media Mode (No Reference): Upload media or skip straight to Next to animate purely by prompt."
+                    },
+                    color = EditoraTextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp
+                )
 
-            if (state.userClips.isNotEmpty()) {
-                val rows = state.userClips.withIndex().chunked(3)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("user_clips_grid"),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    rows.forEach { rowItems ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            rowItems.forEach { indexed ->
-                                ClipChipCard(
-                                    index = indexed.index,
-                                    clip = indexed.value,
-                                    onRemove = { onRemoveUserClip(indexed.index) },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-                            repeat(3 - rowItems.size) {
-                                Spacer(modifier = Modifier.weight(1f))
+                DashedUploadBox(
+                    title = "Tap to Add Videos or Images (Optional for Pure Prompt)",
+                    subtitle = "Single or multiple videos / photos / exact tile templates",
+                    onClick = {
+                        pickMediaLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                        )
+                    },
+                    testTag = "user_media_upload_box"
+                )
+
+                if (state.userClips.isNotEmpty()) {
+                    val rows = state.userClips.withIndex().chunked(3)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("user_clips_grid"),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        rows.forEach { rowItems ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                rowItems.forEach { indexed ->
+                                    ClipChipCard(
+                                        index = indexed.index,
+                                        clip = indexed.value,
+                                        onRemove = { onRemoveUserClip(indexed.index) },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                repeat(3 - rowItems.size) {
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Custom audio bar
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                color = EditoraSurface2,
-                border = BorderStroke(1.dp, EditoraBorder)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp)
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                // Custom audio bar
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = EditoraSurface2,
+                    border = BorderStroke(1.dp, EditoraBorder)
                 ) {
                     Row(
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .defaultMinSize(minHeight = 48.dp)
-                            .testTag("attach_audio_button")
-                            .clickable(role = Role.Button) {
-                                pickAudioLauncher.launch(arrayOf("audio/*", "video/*"))
-                            },
-                        verticalAlignment = Alignment.CenterVertically
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Outlined.MusicNote,
-                            contentDescription = "Attach custom music or audio",
-                            tint = EditoraAccentCyan,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "+ Attach Music / Audio (Optional)",
-                            color = EditoraAccentCyan,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-
-                    StatusPill(
-                        text = if (state.customAudioName.isNotBlank()) {
-                            "${state.customAudioName} (${String.format(Locale.US, "%.1fs", state.customAudioDurationSec)})"
-                        } else {
-                            "None"
-                        },
-                        tone = if (state.customAudioName.isNotBlank()) PillTone.READY else PillTone.NEUTRAL,
-                        modifier = Modifier.testTag("custom_audio_badge")
-                    )
-
-                    if (state.customAudioName.isNotBlank()) {
-                        IconButton(
-                            onClick = onClearCustomAudio,
+                        Row(
                             modifier = Modifier
-                                .size(48.dp)
-                                .testTag("clear_audio_button")
+                                .weight(1f)
+                                .defaultMinSize(minHeight = 48.dp)
+                                .testTag("attach_audio_button")
+                                .clickable(role = Role.Button) {
+                                    pickAudioLauncher.launch(arrayOf("audio/*", "video/*"))
+                                },
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.Close,
-                                contentDescription = "Clear attached audio",
-                                tint = EditoraTextPrimary,
+                                imageVector = Icons.Outlined.MusicNote,
+                                contentDescription = "Attach custom music or audio",
+                                tint = EditoraAccentCyan,
                                 modifier = Modifier.size(16.dp)
                             )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "+ Attach Music / Audio (Optional)",
+                                color = EditoraAccentCyan,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        StatusPill(
+                            text = if (state.customAudioName.isNotBlank()) {
+                                "${state.customAudioName} (${String.format(Locale.US, "%.1fs", state.customAudioDurationSec)})"
+                            } else {
+                                "None"
+                            },
+                            tone = if (state.customAudioName.isNotBlank()) PillTone.READY else PillTone.NEUTRAL,
+                            modifier = Modifier.testTag("custom_audio_badge")
+                        )
+
+                        if (state.customAudioName.isNotBlank()) {
+                            IconButton(
+                                onClick = onClearCustomAudio,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .testTag("clear_audio_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Clear attached audio",
+                                    tint = EditoraTextPrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
                     }
                 }
             }
 
-            // Toggle switches
-            ToggleSettingRow(
-                label = "Include Audio Track (Ref / Custom / AI)",
-                checked = state.includeAudioTrack,
-                onCheckedChange = onToggleIncludeAudio,
-                testTag = "use_ref_audio_toggle"
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                EditoraButton(
+                    text = "← Previous",
+                    onClick = onPreviousStep,
+                    tone = EditoraButtonTone.SECONDARY,
+                    testTag = "step2_prev_button",
+                    modifier = Modifier.weight(1f)
+                )
+                EditoraButton(
+                    text = "Next: AI Prompt →",
+                    onClick = { onSelectStep2SubStep(2) },
+                    tone = EditoraButtonTone.SECONDARY,
+                    testTag = "step2_next_button",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        } else {
+            // Sub-Page 2: Audio / QA Toggles + AI Prompt + Build Edit + Live Monitor
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = "2",
+                    title = "Options & AI Prompt",
+                    pillText = "${state.userClips.size} item${if (state.userClips.size == 1) "" else "s"}",
+                    pillTone = if (state.userClips.isNotEmpty() || state.extraNotes.trim().isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
+                    pillTag = "clips_badge"
+                )
 
-            ToggleSettingRow(
-                label = "Auto Visual QA & Self-Fix (Style Check)",
-                checked = state.autoVisualQa,
-                onCheckedChange = onToggleAutoVisualQa,
-                testTag = "auto_visual_qa_toggle"
-            )
+                ToggleSettingRow(
+                    label = "Include Audio Track (Ref / Custom / AI)",
+                    checked = state.includeAudioTrack,
+                    onCheckedChange = onToggleIncludeAudio,
+                    testTag = "use_ref_audio_toggle"
+                )
 
-            EditoraTextField(
-                value = state.extraNotes,
-                onValueChange = onExtraNotesChanged,
-                placeholder = "AI Prompt / Guidance (e.g. 'Place photos inside exact tile grid size, make tiles mirror-like, add an animated piano on screen' OR without reference: 'Create an anime style piano animation for video')",
-                singleLine = false,
-                minLines = 3,
-                maxLines = 6,
-                testTag = "extra_notes_input"
-            )
+                ToggleSettingRow(
+                    label = "Auto Visual QA & Self-Fix (Style Check)",
+                    checked = state.autoVisualQa,
+                    onCheckedChange = onToggleAutoVisualQa,
+                    testTag = "auto_visual_qa_toggle"
+                )
+
+                EditoraTextField(
+                    value = state.extraNotes,
+                    onValueChange = onExtraNotesChanged,
+                    placeholder = "AI Prompt / Guidance (e.g. 'Place photos inside exact tile grid size, make tiles mirror-like, add an animated piano on screen' OR without reference: 'Create an anime style piano animation for video')",
+                    singleLine = false,
+                    minLines = 3,
+                    maxLines = 5,
+                    testTag = "extra_notes_input"
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    EditoraButton(
+                        text = "AI Plan & Generate Live Edit",
+                        onClick = onBuildEdit,
+                        enabled = canBuild,
+                        testTag = "build_edit_button",
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (isRunning) {
+                        EditoraButton(
+                            text = "Cancel",
+                            onClick = onCancelStage2,
+                            tone = EditoraButtonTone.DANGER,
+                            testTag = "cancel_stage2_button"
+                        )
+                    }
+                }
+
+                LiveProcessMonitor(
+                    state = state.stage2Monitor,
+                    onSwitchModel = onNavigateToSettings,
+                    testTagPrefix = "stage2"
+                )
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 EditoraButton(
-                    text = "AI Plan & Generate Live Edit",
-                    onClick = onBuildEdit,
-                    enabled = canBuild,
-                    testTag = "build_edit_button",
+                    text = "← Previous",
+                    onClick = { onSelectStep2SubStep(1) },
+                    tone = EditoraButtonTone.SECONDARY,
+                    testTag = "step2_prev_button",
                     modifier = Modifier.weight(1f)
                 )
-                if (isRunning) {
-                    EditoraButton(
-                        text = "Cancel",
-                        onClick = onCancelStage2,
-                        tone = EditoraButtonTone.DANGER,
-                        testTag = "cancel_stage2_button"
+                EditoraButton(
+                    text = "Next: Render →",
+                    onClick = onNextStep,
+                    tone = EditoraButtonTone.SECONDARY,
+                    testTag = "step2_next_button",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Step2SubStepBar(
+    currentSubStep: Int,
+    hasMedia: Boolean,
+    hasPromptOrBuild: Boolean,
+    onSelectSubStep: (Int) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = EditoraSurface,
+        border = BorderStroke(1.dp, EditoraBorder)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            val pages = listOf(
+                Triple(1, "2A. Media & Audio", hasMedia),
+                Triple(2, "2B. Options & Prompt", hasPromptOrBuild)
+            )
+            pages.forEach { (page, label, done) ->
+                val active = currentSubStep == page
+                val bg = if (active) EditoraAccent.copy(alpha = 0.18f) else Color.Transparent
+                val fg = when {
+                    active -> EditoraAccentCyan
+                    done -> EditoraSuccessGreen
+                    else -> EditoraTextMuted
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 32.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(bg)
+                        .testTag("step2_subtab_$page")
+                        .clickable(role = Role.Tab) { onSelectSubStep(page) }
+                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        color = fg,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
-
-            LiveProcessMonitor(
-                state = state.stage2Monitor,
-                onSwitchModel = onNavigateToSettings,
-                testTagPrefix = "stage2"
-            )
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            EditoraButton(
-                text = "← Previous",
-                onClick = onPreviousStep,
-                tone = EditoraButtonTone.SECONDARY,
-                testTag = "step2_prev_button",
-                modifier = Modifier.weight(1f)
-            )
-            EditoraButton(
-                text = "Next: Render →",
-                onClick = onNextStep,
-                tone = EditoraButtonTone.SECONDARY,
-                testTag = "step2_next_button",
-                modifier = Modifier.weight(1f)
-            )
         }
     }
 }
