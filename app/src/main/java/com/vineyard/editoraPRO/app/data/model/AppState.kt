@@ -31,11 +31,13 @@ data class ProcessMonitorState(
 data class AppState(
     val activeTab: MainTab = MainTab.STUDIO,
     val wizardStep: Int = 1,
+    val step2SubStep: Int = 1,
     val step1Done: Boolean = false,
     val step2Done: Boolean = false,
     val step3Done: Boolean = false,
 
     // Provider & Settings
+    val settingsSubPage: Int = 1,
     val apiProvider: ProviderMode = ProviderMode.VERTEX_AI,
     val thinkingLevel: ThinkingLevel = ThinkingLevel.DEFAULT,
     val apiKeys: List<ApiKeyEntry> = emptyList(),
