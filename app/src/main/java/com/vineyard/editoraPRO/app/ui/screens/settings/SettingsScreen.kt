@@ -38,7 +38,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -52,6 +54,7 @@ import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
 import com.vineyard.editoraPRO.app.ui.components.CardStepHeader
 import com.vineyard.editoraPRO.app.ui.components.EditoraButton
+import com.vineyard.editoraPRO.app.ui.components.EditoraButtonTone
 import com.vineyard.editoraPRO.app.ui.components.EditoraCard
 import com.vineyard.editoraPRO.app.ui.components.EditoraTextField
 import com.vineyard.editoraPRO.app.ui.components.PillTone
@@ -62,6 +65,7 @@ import com.vineyard.editoraPRO.app.ui.theme.EditoraBg
 import com.vineyard.editoraPRO.app.ui.theme.EditoraBorder
 import com.vineyard.editoraPRO.app.ui.theme.EditoraDangerText
 import com.vineyard.editoraPRO.app.ui.theme.EditoraMonoStyle
+import com.vineyard.editoraPRO.app.ui.theme.EditoraSuccessGreen
 import com.vineyard.editoraPRO.app.ui.theme.EditoraSurface
 import com.vineyard.editoraPRO.app.ui.theme.EditoraSurface2
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTerminalBg
@@ -79,299 +83,380 @@ fun SettingsScreen(
     onSelectThinkingLevel: (ThinkingLevel) -> Unit,
     onSelectExportFps: (Int) -> Unit,
     onSelectMaxCanvasEdge: (Int) -> Unit,
+    onSelectSettingsPage: (Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var apiKeyInput by remember { mutableStateOf("") }
     val nextKeyIdx = if (state.apiKeys.isEmpty()) -1 else (state.cycleIdx % state.apiKeys.size)
+    val currentPage = state.settingsSubPage.coerceIn(1, 2)
 
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // 1. API Provider Mode
-        EditoraCard {
-            CardStepHeader(
-                stepNumber = null,
-                title = "API Provider Mode",
-                pillText = state.apiProvider.shortLabel,
-                pillTone = PillTone.READY,
-                pillTag = "provider_badge"
-            )
-            Text(
-                text = "Choose between Vertex AI (Gemini Platform) or AI Studio (v1beta). Each mode preserves its own API key rotation pool, model list, upload pipeline, and Visual QA behavior.",
-                color = EditoraTextMuted,
-                fontSize = 12.sp,
-                lineHeight = 17.sp
-            )
-            EditoraDropdown(
-                selectedLabel = state.apiProvider.fullLabel,
-                options = ProviderMode.entries.map { it to it.fullLabel },
-                onSelect = onSwitchProvider,
-                testTag = "provider_select"
-            )
-        }
+        SettingsSubPageBar(
+            currentPage = currentPage,
+            hasKeys = state.apiKeys.isNotEmpty(),
+            hasModel = state.selectedModel.isNotBlank(),
+            onSelectPage = onSelectSettingsPage
+        )
 
-        // 2. Gemini API Keys (Auto-Cycle)
-        EditoraCard {
-            CardStepHeader(
-                stepNumber = null,
-                title = "Gemini API Keys (Auto-Cycle)",
-                pillText = "${state.apiKeys.size} key${if (state.apiKeys.size == 1) "" else "s"}",
-                pillTone = if (state.apiKeys.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
-                pillTag = "cycle_status_badge"
-            )
-            Text(
-                text = if (state.apiProvider == ProviderMode.VERTEX_AI) {
-                    "Add multiple Gemini Platform API keys. Each request automatically rotates to the next key in sequence to avoid single-key rate limits."
-                } else {
-                    "Add multiple AI Studio API keys. Each request automatically rotates keys in sequence across v1beta endpoints."
-                },
-                color = EditoraTextMuted,
-                fontSize = 12.sp,
-                lineHeight = 17.sp
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                EditoraTextField(
-                    value = apiKeyInput,
-                    onValueChange = { apiKeyInput = it },
-                    placeholder = if (state.apiProvider == ProviderMode.VERTEX_AI) {
-                        "Paste Gemini Platform API Key"
-                    } else {
-                        "Paste AI Studio API Key"
-                    },
-                    visualTransformation = PasswordVisualTransformation(),
-                    testTag = "api_key_input",
-                    modifier = Modifier.weight(1f)
+        if (currentPage == 1) {
+            // Page 1: API Provider Mode + Gemini API Keys (Auto-Cycle)
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = null,
+                    title = "API Provider Mode",
+                    pillText = state.apiProvider.shortLabel,
+                    pillTone = PillTone.READY,
+                    pillTag = "provider_badge"
                 )
-                EditoraButton(
-                    text = "Add",
-                    onClick = {
-                        onAddApiKey(apiKeyInput)
-                        if (apiKeyInput.trim().length >= 10) {
-                            apiKeyInput = ""
-                        }
-                    },
-                    testTag = "add_key_button"
+                Text(
+                    text = "Choose between Vertex AI (Gemini Platform) or AI Studio (v1beta). Each mode preserves its own API key rotation pool, model list, upload pipeline, and Visual QA behavior.",
+                    color = EditoraTextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp
                 )
-            }
-
-            if (state.apiKeys.isNotEmpty()) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("api_key_list"),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    state.apiKeys.forEachIndexed { index, entry ->
-                        ApiKeyRow(
-                            entry = entry,
-                            isNext = index == nextKeyIdx,
-                            index = index,
-                            onRemove = { onRemoveApiKey(index) }
-                        )
-                    }
-                }
-            }
-        }
-
-        // 3. Live Server Models + Thinking Level
-        EditoraCard {
-            CardStepHeader(
-                stepNumber = null,
-                title = "Live Server Models",
-                pillText = if (state.models.isEmpty()) "Not fetched" else "${state.models.size} live",
-                pillTone = if (state.models.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
-                pillTag = "model_count_badge"
-            )
-            Text(
-                text = if (state.apiProvider == ProviderMode.VERTEX_AI) {
-                    "Tap the fetch icon to verify available models directly against Gemini Platform (lunar-tag/global). Only your selected model is used."
-                } else {
-                    "Tap the fetch icon to verify available models directly against Google AI Studio (v1beta). Only your selected model is used."
-                },
-                color = EditoraTextMuted,
-                fontSize = 12.sp,
-                lineHeight = 17.sp
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val modelLabel = state.selectedModel.removePrefix("models/")
-                    .ifBlank { "-- Fetch live models first --" }
                 EditoraDropdown(
-                    selectedLabel = modelLabel,
-                    options = state.models.map { it.name to it.shortName() },
-                    onSelect = onSelectModel,
-                    enabled = state.models.isNotEmpty(),
-                    testTag = "model_select",
-                    modifier = Modifier.weight(1f)
+                    selectedLabel = state.apiProvider.fullLabel,
+                    options = ProviderMode.entries.map { it to it.fullLabel },
+                    onSelect = onSwitchProvider,
+                    testTag = "provider_select"
                 )
+            }
 
-                val infiniteTransition = rememberInfiniteTransition(label = "fetch_spin")
-                val spinAngle by infiniteTransition.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 360f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(durationMillis = 850, easing = LinearEasing),
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "spin_deg"
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = null,
+                    title = "Gemini API Keys (Auto-Cycle)",
+                    pillText = "${state.apiKeys.size} key${if (state.apiKeys.size == 1) "" else "s"}",
+                    pillTone = if (state.apiKeys.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
+                    pillTag = "cycle_status_badge"
                 )
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = EditoraSurface2,
-                    border = BorderStroke(1.dp, EditoraBorder)
+                Text(
+                    text = if (state.apiProvider == ProviderMode.VERTEX_AI) {
+                        "Add multiple Gemini Platform API keys. Each request automatically rotates to the next key in sequence to avoid single-key rate limits."
+                    } else {
+                        "Add multiple AI Studio API keys. Each request automatically rotates keys in sequence across v1beta endpoints."
+                    },
+                    color = EditoraTextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = onFetchLiveModels,
-                        enabled = !state.isFetchingModels,
+                    EditoraTextField(
+                        value = apiKeyInput,
+                        onValueChange = { apiKeyInput = it },
+                        placeholder = if (state.apiProvider == ProviderMode.VERTEX_AI) {
+                            "Paste Gemini Platform API Key"
+                        } else {
+                            "Paste AI Studio API Key"
+                        },
+                        visualTransformation = PasswordVisualTransformation(),
+                        testTag = "api_key_input",
+                        modifier = Modifier.weight(1f)
+                    )
+                    EditoraButton(
+                        text = "Add",
+                        onClick = {
+                            onAddApiKey(apiKeyInput)
+                            if (apiKeyInput.trim().length >= 10) {
+                                apiKeyInput = ""
+                            }
+                        },
+                        testTag = "add_key_button"
+                    )
+                }
+
+                if (state.apiKeys.isNotEmpty()) {
+                    Column(
                         modifier = Modifier
-                            .size(48.dp)
-                            .testTag("fetch_models_button")
+                            .fillMaxWidth()
+                            .testTag("api_key_list"),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Refresh,
-                            contentDescription = "Fetch live models from server",
-                            tint = EditoraAccentCyan,
-                            modifier = Modifier
-                                .size(20.dp)
-                                .rotate(if (state.isFetchingModels) spinAngle else 0f)
-                        )
+                        state.apiKeys.forEachIndexed { index, entry ->
+                            ApiKeyRow(
+                                entry = entry,
+                                isNext = index == nextKeyIdx,
+                                index = index,
+                                onRemove = { onRemoveApiKey(index) }
+                            )
+                        }
                     }
                 }
             }
 
-            val selectedInfo = state.models.firstOrNull { it.name == state.selectedModel }
-            AnimatedVisibility(visible = selectedInfo != null) {
-                if (selectedInfo != null) {
+            EditoraButton(
+                text = "Next: Models & Render →",
+                onClick = { onSelectSettingsPage(2) },
+                tone = EditoraButtonTone.SECONDARY,
+                testTag = "settings_next_btn",
+                modifier = Modifier.fillMaxWidth()
+            )
+        } else {
+            // Page 2: Live Server Models (+ Thinking Level) + Render Preferences
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = null,
+                    title = "Live Server Models",
+                    pillText = if (state.models.isEmpty()) "Not fetched" else "${state.models.size} live",
+                    pillTone = if (state.models.isNotEmpty()) PillTone.READY else PillTone.NEUTRAL,
+                    pillTag = "model_count_badge"
+                )
+                Text(
+                    text = if (state.apiProvider == ProviderMode.VERTEX_AI) {
+                        "Tap the fetch icon to verify available models directly against Gemini Platform (lunar-tag/global). Only your selected model is used."
+                    } else {
+                        "Tap the fetch icon to verify available models directly against Google AI Studio (v1beta). Only your selected model is used."
+                    },
+                    color = EditoraTextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val modelLabel = state.selectedModel.removePrefix("models/")
+                        .ifBlank { "-- Fetch live models first --" }
+                    EditoraDropdown(
+                        selectedLabel = modelLabel,
+                        options = state.models.map { it.name to it.shortName() },
+                        onSelect = onSelectModel,
+                        enabled = state.models.isNotEmpty(),
+                        testTag = "model_select",
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    val infiniteTransition = rememberInfiniteTransition(label = "fetch_spin")
+                    val spinAngle by infiniteTransition.animateFloat(
+                        initialValue = 0f,
+                        targetValue = 360f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 850, easing = LinearEasing),
+                            repeatMode = RepeatMode.Restart
+                        ),
+                        label = "spin_deg"
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = EditoraSurface2,
+                        border = BorderStroke(1.dp, EditoraBorder)
+                    ) {
+                        IconButton(
+                            onClick = onFetchLiveModels,
+                            enabled = !state.isFetchingModels,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("fetch_models_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Refresh,
+                                contentDescription = "Fetch live models from server",
+                                tint = EditoraAccentCyan,
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .rotate(if (state.isFetchingModels) spinAngle else 0f)
+                            )
+                        }
+                    }
+                }
+
+                val selectedInfo = state.models.firstOrNull { it.name == state.selectedModel }
+                AnimatedVisibility(visible = selectedInfo != null) {
+                    if (selectedInfo != null) {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("model_info_box"),
+                            shape = RoundedCornerShape(10.dp),
+                            color = EditoraTerminalBg,
+                            border = BorderStroke(1.dp, EditoraBorder)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                if (selectedInfo.displayName.isNotBlank()) {
+                                    Text(
+                                        text = selectedInfo.displayName,
+                                        color = EditoraTextPrimary,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                if (selectedInfo.description.isNotBlank()) {
+                                    Text(
+                                        text = selectedInfo.description,
+                                        color = EditoraTextMuted,
+                                        fontSize = 11.sp,
+                                        lineHeight = 15.sp
+                                    )
+                                }
+                                if (selectedInfo.inputTokenLimit != null || selectedInfo.outputTokenLimit != null) {
+                                    Text(
+                                        text = "Limits: in=${selectedInfo.inputTokenLimit ?: "?"} • out=${selectedInfo.outputTokenLimit ?: "?"}",
+                                        style = EditoraMonoStyle.copy(fontSize = 10.5.sp),
+                                        color = EditoraAccentCyan
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                AnimatedVisibility(visible = state.apiProvider == ProviderMode.AI_STUDIO) {
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("model_info_box"),
-                        shape = RoundedCornerShape(10.dp),
-                        color = EditoraTerminalBg,
-                        border = BorderStroke(1.dp, EditoraBorder)
+                            .testTag("thinking_level_wrap"),
+                        shape = RoundedCornerShape(12.dp),
+                        color = EditoraAccent.copy(alpha = 0.06f),
+                        border = BorderStroke(1.dp, EditoraAccent.copy(alpha = 0.22f))
                     ) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            if (selectedInfo.displayName.isNotBlank()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
                                 Text(
-                                    text = selectedInfo.displayName,
-                                    color = EditoraTextPrimary,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
+                                    text = "Reasoning / Thinking Level (AI Studio)",
+                                    color = EditoraAccentCyan,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                StatusPill(
+                                    text = state.thinkingLevel.badgeLabel,
+                                    tone = PillTone.NEXT,
+                                    modifier = Modifier.testTag("thinking_level_badge")
                                 )
                             }
-                            if (selectedInfo.description.isNotBlank()) {
-                                Text(
-                                    text = selectedInfo.description,
-                                    color = EditoraTextMuted,
-                                    fontSize = 11.sp,
-                                    lineHeight = 15.sp
-                                )
-                            }
-                            if (selectedInfo.inputTokenLimit != null || selectedInfo.outputTokenLimit != null) {
-                                Text(
-                                    text = "Limits: in=${selectedInfo.inputTokenLimit ?: "?"} • out=${selectedInfo.outputTokenLimit ?: "?"}",
-                                    style = EditoraMonoStyle.copy(fontSize = 10.5.sp),
-                                    color = EditoraAccentCyan
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            AnimatedVisibility(visible = state.apiProvider == ProviderMode.AI_STUDIO) {
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("thinking_level_wrap"),
-                    shape = RoundedCornerShape(12.dp),
-                    color = EditoraAccent.copy(alpha = 0.06f),
-                    border = BorderStroke(1.dp, EditoraAccent.copy(alpha = 0.22f))
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                            EditoraDropdown(
+                                selectedLabel = state.thinkingLevel.label,
+                                options = ThinkingLevel.entries.map { it to it.label },
+                                onSelect = onSelectThinkingLevel,
+                                testTag = "thinking_level_select"
+                            )
                             Text(
-                                text = "Reasoning / Thinking Level (AI Studio)",
-                                color = EditoraAccentCyan,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            StatusPill(
-                                text = state.thinkingLevel.badgeLabel,
-                                tone = PillTone.NEXT,
-                                modifier = Modifier.testTag("thinking_level_badge")
+                                text = "Applies thinkingLevel (Gemini 3 / 3.5 / 4) or mapped thinkingBudget (Gemini 2.5) automatically for the selected AI Studio model.",
+                                color = EditoraTextMuted,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp
                             )
                         }
+                    }
+                }
+            }
+
+            EditoraCard {
+                Text(
+                    text = "Render Preferences",
+                    color = EditoraTextPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(text = "Export FPS", color = EditoraTextMuted, fontSize = 12.sp)
                         EditoraDropdown(
-                            selectedLabel = state.thinkingLevel.label,
-                            options = ThinkingLevel.entries.map { it to it.label },
-                            onSelect = onSelectThinkingLevel,
-                            testTag = "thinking_level_select"
+                            selectedLabel = if (state.exportFps == 24) "24 fps (Cinematic)" else "30 fps (Smooth)",
+                            options = listOf(24 to "24 fps (Cinematic)", 30 to "30 fps (Smooth)"),
+                            onSelect = onSelectExportFps,
+                            testTag = "fps_select"
                         )
-                        Text(
-                            text = "Applies thinkingLevel (Gemini 3 / 3.5 / 4) or mapped thinkingBudget (Gemini 2.5) automatically for the selected AI Studio model.",
-                            color = EditoraTextMuted,
-                            fontSize = 11.sp,
-                            lineHeight = 15.sp
+                    }
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(text = "Max Canvas Edge", color = EditoraTextMuted, fontSize = 12.sp)
+                        EditoraDropdown(
+                            selectedLabel = if (state.maxCanvasEdge == 720) "720p (Fast Mobile)" else "1080p (HD)",
+                            options = listOf(720 to "720p (Fast Mobile)", 1080 to "1080p (HD)"),
+                            onSelect = onSelectMaxCanvasEdge,
+                            testTag = "res_select"
                         )
                     }
                 }
             }
-        }
 
-        // 4. Render Preferences
-        EditoraCard {
-            Text(
-                text = "Render Preferences",
-                color = EditoraTextPrimary,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold
+            EditoraButton(
+                text = "← Previous: Provider & Keys",
+                onClick = { onSelectSettingsPage(1) },
+                tone = EditoraButtonTone.SECONDARY,
+                testTag = "settings_prev_btn",
+                modifier = Modifier.fillMaxWidth()
             )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(text = "Export FPS", color = EditoraTextMuted, fontSize = 12.sp)
-                    EditoraDropdown(
-                        selectedLabel = if (state.exportFps == 24) "24 fps (Cinematic)" else "30 fps (Smooth)",
-                        options = listOf(24 to "24 fps (Cinematic)", 30 to "30 fps (Smooth)"),
-                        onSelect = onSelectExportFps,
-                        testTag = "fps_select"
-                    )
+        }
+    }
+}
+
+@Composable
+private fun SettingsSubPageBar(
+    currentPage: Int,
+    hasKeys: Boolean,
+    hasModel: Boolean,
+    onSelectPage: (Int) -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = EditoraSurface,
+        border = BorderStroke(1.dp, EditoraBorder)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            val pages = listOf(
+                Triple(1, "1. Provider & Keys", hasKeys),
+                Triple(2, "2. Models & Render", hasModel)
+            )
+            pages.forEach { (page, label, done) ->
+                val active = currentPage == page
+                val bg = if (active) EditoraAccent.copy(alpha = 0.18f) else Color.Transparent
+                val fg = when {
+                    active -> EditoraAccentCyan
+                    done -> EditoraSuccessGreen
+                    else -> EditoraTextMuted
                 }
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(text = "Max Canvas Edge", color = EditoraTextMuted, fontSize = 12.sp)
-                    EditoraDropdown(
-                        selectedLabel = if (state.maxCanvasEdge == 720) "720p (Fast Mobile)" else "1080p (HD)",
-                        options = listOf(720 to "720p (Fast Mobile)", 1080 to "1080p (HD)"),
-                        onSelect = onSelectMaxCanvasEdge,
-                        testTag = "res_select"
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .defaultMinSize(minHeight = 36.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(bg)
+                        .testTag("settings_page_tab_$page")
+                        .clickable(role = Role.Tab) { onSelectPage(page) }
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = label,
+                        color = fg,
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
