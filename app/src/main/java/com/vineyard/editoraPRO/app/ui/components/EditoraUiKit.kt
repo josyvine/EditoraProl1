@@ -2,7 +2,6 @@ package com.vineyard.editoraPRO.app.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -14,7 +13,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -246,43 +244,31 @@ fun EditoraButton(
                 onClick = onClick,
                 enabled = enabled,
                 shape = shape,
+                elevation = null,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color.Transparent,
                     disabledContainerColor = Color.Transparent,
                     contentColor = Color.White,
                     disabledContentColor = Color.White.copy(alpha = 0.5f)
                 ),
-                contentPadding = PaddingValues(0.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 11.dp),
                 modifier = modifier
                     .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+                    .clip(shape)
+                    .background(brush = brush, alpha = if (enabled) 1f else 0.42f)
                     .testTag(testTag)
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .defaultMinSize(minHeight = 48.dp)
-                        .clip(shape)
-                        .background(brush = brush, alpha = if (enabled) 1f else 0.42f)
-                        .padding(horizontal = 14.dp, vertical = 11.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        if (leadingIcon != null) {
-                            leadingIcon()
-                            Spacer(modifier = Modifier.width(6.dp))
-                        }
-                        Text(
-                            text = text,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
+                if (leadingIcon != null) {
+                    leadingIcon()
+                    Spacer(modifier = Modifier.width(6.dp))
                 }
+                Text(
+                    text = text,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
         EditoraButtonTone.SECONDARY, EditoraButtonTone.WARN, EditoraButtonTone.DANGER -> {
@@ -354,7 +340,9 @@ fun EditoraTextField(
             Text(
                 text = placeholder,
                 color = EditoraTextMuted.copy(alpha = 0.72f),
-                fontSize = 13.sp
+                fontSize = 13.sp,
+                maxLines = if (singleLine) 1 else maxLines,
+                overflow = TextOverflow.Ellipsis
             )
         },
         singleLine = singleLine,
