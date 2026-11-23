@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/editora_pro_icon_1795387139028"
+        android:drawable="@drawable/editorapro.png"
         android:gravity="center" />
 </layer-list>
