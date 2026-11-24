@@ -420,6 +420,8 @@ class QuickJsRunner(
         editPlan: List<EditPlanSegment>
     ) = withContext(jsDispatcher) {
         updateClips(clips)
+        c2d.clearAllUserBuffers()
+        frameRingKeys.clear()
         val engine = ensureQuickJsReady()
         aiGeneratedAudioBuffer = null
 
@@ -732,9 +734,19 @@ class QuickJsRunner(
         if (c2d.getBitmap(raw) != null) return raw
         val clipIdx = parseClipIndex(raw) ?: return null
         val t = clipSeekTimes[clipIdx] ?: 0f
+        val qTick = (t * 24f).roundToInt()
+        val key = "__frame_${clipIdx}_$qTick"
+        if (c2d.getBitmap(key) != null) return key
         val bmp = extractClipBitmapSync(clipIdx, t) ?: return null
-        val key = "__frame_${clipIdx}_${(t * 30f).roundToInt()}"
         c2d.putBitmapAsSurface(key, bmp.copy(Bitmap.Config.ARGB_8888, true))
+        if (clipsList.getOrNull(clipIdx)?.isImage != true) {
+            bmp.recycle()
+        }
+        frameRingKeys.addLast(key)
+        while (frameRingKeys.size > 18) {
+            val oldKey = frameRingKeys.removeFirst()
+            c2d.removeSurface(oldKey)
+        }
         return key
     }
 
@@ -775,16 +787,21 @@ class QuickJsRunner(
 
     override suspend fun getFrame(clipIndex: Int, timeSec: Float): String = withContext(Dispatchers.Default) {
         clipSeekTimes[clipIndex] = timeSec
+        val qTick = (timeSec * 24f).roundToInt()
+        val ringKey = "__frame_${clipIndex}_$qTick"
+        if (c2d.getBitmap(ringKey) != null) {
+            return@withContext ringKey
+        }
         val bmp = extractClipBitmapSync(clipIndex, timeSec)
             ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
-        val ringKey = "__frame_${clipIndex}_${(timeSec * 30f).roundToInt()}"
         c2d.putBitmapAsSurface(ringKey, bmp.copy(Bitmap.Config.ARGB_8888, true))
-        if (!clipsList.getOrNull(clipIndex)?.isImage.let { it == true }) {
+        if (clipsList.getOrNull(clipIndex)?.isImage != true) {
             bmp.recycle()
         }
         frameRingKeys.addLast(ringKey)
-        while (frameRingKeys.size > 12) {
-            frameRingKeys.removeFirst()
+        while (frameRingKeys.size > 18) {
+            val oldKey = frameRingKeys.removeFirst()
+            c2d.removeSurface(oldKey)
         }
         ringKey
     }
