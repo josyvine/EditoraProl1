@@ -314,7 +314,7 @@ fun SettingsScreen(
                     }
                 }
 
-                AnimatedVisibility(visible = state.apiProvider == ProviderMode.AI_STUDIO) {
+                AnimatedVisibility(visible = state.apiProvider == ProviderMode.AI_STUDIO && state.selectedModel.isNotBlank()) {
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
