@@ -5,8 +5,11 @@ import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
 import com.vineyard.editoraPRO.app.data.model.UploadedFileRecord
 import com.vineyard.editoraPRO.app.security.SecurityGuard
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonArray
@@ -46,27 +49,37 @@ class AiStudioService(
         onLog("Querying GET /v1beta/models for live AI Studio models...")
 
         val req = Request.Builder().url(url).get().build()
-        httpClient.newCall(req).execute().use { resp ->
-            val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                val msg = extractErrorMessage(bodyStr) ?: "Fetch failed"
-                throw GeminiHttpException(resp.code, "[HTTP ${resp.code}] $msg")
+        val call = httpClient.newCall(req)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+
+        try {
+            call.execute().use { resp ->
+                val bodyStr = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    val msg = extractErrorMessage(bodyStr) ?: "Fetch failed"
+                    throw GeminiHttpException(resp.code, "[HTTP ${resp.code}] $msg")
+                }
+                val root = json.parseToJsonElement(bodyStr).jsonObject
+                val arr = root["models"]?.jsonArray ?: return@withContext emptyList()
+                arr.mapNotNull { el ->
+                    val obj = el.jsonObject
+                    val methods = obj["supportedGenerationMethods"]?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+                    if (!methods.contains("generateContent")) return@mapNotNull null
+                    GeminiModelInfo(
+                        name = obj["name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null,
+                        displayName = obj["displayName"]?.jsonPrimitive?.contentOrNull ?: "",
+                        description = obj["description"]?.jsonPrimitive?.contentOrNull ?: "",
+                        inputTokenLimit = obj["inputTokenLimit"]?.jsonPrimitive?.intOrNull,
+                        outputTokenLimit = obj["outputTokenLimit"]?.jsonPrimitive?.intOrNull
+                    )
+                }
             }
-            val root = json.parseToJsonElement(bodyStr).jsonObject
-            val arr = root["models"]?.jsonArray ?: return@withContext emptyList()
-            arr.mapNotNull { el ->
-                val obj = el.jsonObject
-                val methods = obj["supportedGenerationMethods"]?.jsonArray
-                    ?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
-                if (!methods.contains("generateContent")) return@mapNotNull null
-                GeminiModelInfo(
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null,
-                    displayName = obj["displayName"]?.jsonPrimitive?.contentOrNull ?: "",
-                    description = obj["description"]?.jsonPrimitive?.contentOrNull ?: "",
-                    inputTokenLimit = obj["inputTokenLimit"]?.jsonPrimitive?.intOrNull,
-                    outputTokenLimit = obj["outputTokenLimit"]?.jsonPrimitive?.intOrNull
-                )
-            }
+        } catch (e: IOException) {
+            if (!coroutineContext.isActive) throw CancellationException("Cancelled by user.")
+            throw e
+        } finally {
+            cancelHandle?.dispose()
         }
     }
 
@@ -136,21 +149,30 @@ class AiStudioService(
         val base = SecurityGuard.getAiStudioBaseUrl()
         val uploadUrl = "$base/upload/v1beta/files?uploadType=multipart&key=${URLEncoder.encode(apiKey, "UTF-8")}"
         val req = Request.Builder().url(uploadUrl).post(requestBody).build()
+        val uploadCall = httpClient.newCall(req)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { uploadCall.cancel() }
 
-        var record: UploadedFileRecord = httpClient.newCall(req).execute().use { resp ->
-            val respText = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                val msg = extractErrorMessage(respText) ?: "Files API upload failed"
-                throw GeminiHttpException(resp.code, "[HTTP ${resp.code}] $msg")
+        var record: UploadedFileRecord = try {
+            uploadCall.execute().use { resp ->
+                val respText = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    val msg = extractErrorMessage(respText) ?: "Files API upload failed"
+                    throw GeminiHttpException(resp.code, "[HTTP ${resp.code}] $msg")
+                }
+                val fileObj = json.parseToJsonElement(respText).jsonObject["file"]?.jsonObject
+                    ?: throw IOException("Missing file object in upload response")
+                UploadedFileRecord(
+                    name = fileObj["name"]?.jsonPrimitive?.contentOrNull ?: "",
+                    uri = fileObj["uri"]?.jsonPrimitive?.contentOrNull ?: "",
+                    mimeType = fileObj["mimeType"]?.jsonPrimitive?.contentOrNull ?: mimeType,
+                    state = fileObj["state"]?.jsonPrimitive?.contentOrNull ?: "PROCESSING"
+                )
             }
-            val fileObj = json.parseToJsonElement(respText).jsonObject["file"]?.jsonObject
-                ?: throw IOException("Missing file object in upload response")
-            UploadedFileRecord(
-                name = fileObj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                uri = fileObj["uri"]?.jsonPrimitive?.contentOrNull ?: "",
-                mimeType = fileObj["mimeType"]?.jsonPrimitive?.contentOrNull ?: mimeType,
-                state = fileObj["state"]?.jsonPrimitive?.contentOrNull ?: "PROCESSING"
-            )
+        } catch (e: IOException) {
+            if (!coroutineContext.isActive) throw CancellationException("Cancelled by user.")
+            throw e
+        } finally {
+            cancelHandle?.dispose()
         }
 
         onLog("Upload finished → File URI: ${record.name} (state: ${record.state})")
@@ -161,19 +183,28 @@ class AiStudioService(
             delay(1500)
             val pollUrl = "$base/v1beta/${record.name}?key=${URLEncoder.encode(apiKey, "UTF-8")}"
             val pollReq = Request.Builder().url(pollUrl).get().build()
-            record = httpClient.newCall(pollReq).execute().use { pollResp ->
-                val pollText = pollResp.body?.string().orEmpty()
-                if (!pollResp.isSuccessful) {
-                    val msg = extractErrorMessage(pollText) ?: "File polling failed"
-                    throw GeminiHttpException(pollResp.code, "[HTTP ${pollResp.code}] $msg")
+            val pollCall = httpClient.newCall(pollReq)
+            val pollCancelHandle = coroutineContext[Job]?.invokeOnCompletion { pollCall.cancel() }
+            record = try {
+                pollCall.execute().use { pollResp ->
+                    val pollText = pollResp.body?.string().orEmpty()
+                    if (!pollResp.isSuccessful) {
+                        val msg = extractErrorMessage(pollText) ?: "File polling failed"
+                        throw GeminiHttpException(pollResp.code, "[HTTP ${pollResp.code}] $msg")
+                    }
+                    val fileObj = json.parseToJsonElement(pollText).jsonObject
+                    UploadedFileRecord(
+                        name = fileObj["name"]?.jsonPrimitive?.contentOrNull ?: record.name,
+                        uri = fileObj["uri"]?.jsonPrimitive?.contentOrNull ?: record.uri,
+                        mimeType = fileObj["mimeType"]?.jsonPrimitive?.contentOrNull ?: record.mimeType,
+                        state = fileObj["state"]?.jsonPrimitive?.contentOrNull ?: "ACTIVE"
+                    )
                 }
-                val fileObj = json.parseToJsonElement(pollText).jsonObject
-                UploadedFileRecord(
-                    name = fileObj["name"]?.jsonPrimitive?.contentOrNull ?: record.name,
-                    uri = fileObj["uri"]?.jsonPrimitive?.contentOrNull ?: record.uri,
-                    mimeType = fileObj["mimeType"]?.jsonPrimitive?.contentOrNull ?: record.mimeType,
-                    state = fileObj["state"]?.jsonPrimitive?.contentOrNull ?: "ACTIVE"
-                )
+            } catch (e: IOException) {
+                if (!coroutineContext.isActive) throw CancellationException("Cancelled by user.")
+                throw e
+            } finally {
+                pollCancelHandle?.dispose()
             }
             onLog("Server video processing state: ${record.state}")
         }
@@ -250,6 +281,7 @@ class AiStudioService(
             .build()
 
         val call = httpClient.newCall(request)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
         val gotAnyData = AtomicBoolean(false)
 
         val watchdogThread = Thread {
@@ -363,11 +395,15 @@ class AiStudioService(
                 result
             }
         } catch (e: IOException) {
+            if (!coroutineContext.isActive) {
+                throw CancellationException("Cancelled by user.")
+            }
             if (!gotAnyData.get() && call.isCanceled()) {
                 throw GeminiHttpException(408, "Model \"$modelId\" did not respond within 90s")
             }
             throw e
         } finally {
+            cancelHandle?.dispose()
             watchdogThread.interrupt()
         }
     }
