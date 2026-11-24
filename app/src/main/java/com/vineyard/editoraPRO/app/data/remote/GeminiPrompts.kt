@@ -12,14 +12,14 @@ object GeminiPrompts {
         "- await runtime.seekClip(mediaEl, timeSec) -> seeks video (safe instant no-op for images).",
         "- await runtime.getFrame(mediaEl, timeSec) -> works for BOTH videos AND images! Returns readable snapshot.",
         "- runtime.drawCover(ctx, media, x, y, w, h, zoom=1) -> draws media covering rect (x,y,w,h) without stretching/squashing aspect ratio.",
-        "- runtime.runShader(key, outW, outH, fragmentGlsl, texturesMap={}, uniformsMap={}) -> raw WebGL2/OpenGL ES 3.0 GPU fragment shader runner! Supports GLSL ES 1.00 and `#version 300 es`, auto-provides `v_uv` (0..1) and `u_resolution` (vec2(outW, outH)), binds textures and uniforms, returns canvas ready for `ctx.drawImage()`.",
+        "- await runtime.runShader(key, outW, outH, fragmentGlsl, texturesMap={}, uniformsMap={}) -> async raw WebGL2/OpenGL ES 3.0 GPU fragment shader runner! Always `await` it. Supports GLSL ES 1.00 and `#version 300 es`, auto-provides `v_uv` (0..1) and `u_resolution` (vec2(outW, outH)), binds textures and uniforms, returns canvas ready for `ctx.drawImage()`.",
         "- await runtime.detectBoxes(mediaEl, timeSec=0) -> returns [{ label: string, score: number, box: [x,y,w,h] }] (0..1 normalized) for 80 object classes.",
         "- await runtime.getMediaPipeMask(mediaEl, w, h) -> returns raw { width, height, data: Float32Array } (0.0..1.0) of ALL humans (front, back, side & crowds).",
         "- await runtime.segmentMediaPipe(mediaEl, w, h, featherOrOpts=0.45) -> transparent cutout canvas of ALL humans.",
         "- await runtime.getSamMask(mediaEl, w, h, promptOpts) -> promptOpts = { boxes: [[x,y,w,h], ...], points: [{x,y,label:1|0}, ...] }. Returns { width, height, data: Float32Array } (0.0..1.0).",
         "- await runtime.segmentSam(mediaEl, w, h, promptOpts, featherOrOpts=0.45) -> transparent cutout canvas of prompted object/subject.",
         "- runtime.chromaKey(mediaEl, w, h, targetRGB=[0,200,0], tolerance=90, feather=35) -> chroma-key cutout canvas.",
-        "- runtime.extractAudio(clip) -> returns pre-decoded AudioBuffer of clip (or null).",
+        "- runtime.extractAudio(clip) -> synchronous (do NOT chain .catch() on it); returns pre-decoded AudioBuffer of clip (or null).",
         "- runtime.setAudioBuffer(audioBuffer) -> registers active audio track.",
         "- STATE & CANVAS CONTRACT: Draw directly onto passed 'ctx' (do NOT 'return canvas;'). Store persistent state in top-level variables. Compute all sizes and coordinates proportionally from (width, height). Time 't' is in seconds (0..duration); never multiply 't * duration'."
     ).joinToString("\n")
