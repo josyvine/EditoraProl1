@@ -234,8 +234,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val resolvedSelected = if (fetched.any { it.name == curSelected }) {
                     curSelected
                 } else {
-                    fetched.firstOrNull { it.name.contains("flash", ignoreCase = true) }?.name
-                        ?: fetched.firstOrNull()?.name.orEmpty()
+                    fetched.firstOrNull()?.name.orEmpty()
                 }
                 prefs.saveModels(_uiState.value.apiProvider, fetched)
                 prefs.saveSelectedModel(_uiState.value.apiProvider, resolvedSelected)
