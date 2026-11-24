@@ -17,6 +17,7 @@ import com.vineyard.editoraPRO.app.domain.vision.SamPointPrompt
 import com.vineyard.editoraPRO.app.domain.vision.SamPromptOptions
 import com.vineyard.editoraPRO.app.domain.vision.SmartSegmenter
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.ensureActive
@@ -27,11 +28,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 data class TechnicalValidationResult(
@@ -63,6 +64,8 @@ class QuickJsRunner(
     private val retrieverCache = ConcurrentHashMap<Int, MediaMetadataRetriever>()
     private val clipSeekTimes = ConcurrentHashMap<Int, Float>()
     private val frameRingKeys = ArrayDeque<String>()
+    private val pendingAsyncEvals = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
+    private val asyncEvalSeq = AtomicInteger(1)
 
     @Volatile
     var aiGeneratedAudioBuffer: PcmAudioBuffer? = null
@@ -79,6 +82,19 @@ class QuickJsRunner(
 
     private fun bindHostApis(instance: QuickJs) {
         instance.define("__host") {
+            function("onAsyncDone") { args ->
+                val id = (args.getOrNull(0) as? Number)?.toInt() ?: return@function null
+                val ok = (args.getOrNull(1) as? Boolean) ?: false
+                val err = args.getOrNull(2)?.toString().orEmpty()
+                val deferred = pendingAsyncEvals.remove(id)
+                if (deferred != null) {
+                    if (ok) deferred.complete(Unit)
+                    else deferred.completeExceptionally(
+                        IllegalStateException(err.ifBlank { "JS async execution failed." })
+                    )
+                }
+                null
+            }
             function("ensureCanvas") { args ->
                 val h = args.getOrNull(0)?.toString() ?: "__tmp"
                 val w = (args.getOrNull(1) as? Number)?.toInt() ?: 2
@@ -393,6 +409,37 @@ class QuickJsRunner(
         }
     }
 
+    private suspend fun evaluateAsyncJs(engine: QuickJs, asyncBodyJs: String) {
+        val id = asyncEvalSeq.getAndIncrement()
+        val deferred = CompletableDeferred<Unit>()
+        pendingAsyncEvals[id] = deferred
+        try {
+            withContext(jsDispatcher) {
+                engine.evaluate<Any?>(
+                    """
+                    (function() {
+                      const __evalId = $id;
+                      Promise.resolve()
+                        .then(async function() {
+                          $asyncBodyJs
+                        })
+                        .then(
+                          function() { __host.onAsyncDone(__evalId, true, ""); },
+                          function(err) {
+                            const msg = (err && (err.stack || err.message)) ? String(err.stack || err.message) : String(err);
+                            __host.onAsyncDone(__evalId, false, msg);
+                          }
+                        );
+                    })();
+                    """.trimIndent()
+                )
+            }
+            deferred.await()
+        } finally {
+            pendingAsyncEvals.remove(id)
+        }
+    }
+
     suspend fun compileTools(toolsCode: String): List<String> = withContext(jsDispatcher) {
         val engine = ensureQuickJsReady()
         val cleaned = toolsCode.ifBlank { "const tools = {};" }
@@ -418,161 +465,164 @@ class QuickJsRunner(
         toolsCode: String,
         clips: List<ClipAsset>,
         editPlan: List<EditPlanSegment>
-    ) = withContext(jsDispatcher) {
-        updateClips(clips)
-        c2d.clearAllUserBuffers()
-        frameRingKeys.clear()
-        val engine = ensureQuickJsReady()
-        aiGeneratedAudioBuffer = null
+    ) {
+        val engine = withContext(jsDispatcher) {
+            updateClips(clips)
+            c2d.clearAllUserBuffers()
+            frameRingKeys.clear()
+            val q = ensureQuickJsReady()
+            aiGeneratedAudioBuffer = null
 
-        val hasToolsDecl = Regex("\\b(?:const|let|var)\\s+tools\\b").containsMatchIn(pipelineCode)
-        val toolsParam = if (hasToolsDecl) "_stage1Tools" else "tools"
-        val planJson = json.encodeToString(editPlan)
-        val escapedTools = toolsCode.ifBlank { "const tools = {};" }
+            val planJson = json.encodeToString(editPlan)
+            val escapedTools = toolsCode.ifBlank { "const tools = {};" }
 
-        val clipObjsJs = clips.mapIndexed { idx, c ->
-            """{
-              clipIndex: $idx,
-              isImage: ${c.isImage},
-              name: ${json.encodeToString(c.name)},
-              width: ${c.width},
-              height: ${c.height},
-              videoWidth: ${c.width},
-              videoHeight: ${c.height},
-              naturalWidth: ${c.width},
-              naturalHeight: ${c.height},
-              duration: ${c.durationSec},
-              durationSec: ${c.durationSec},
-              hasAudio: ${c.hasAudio},
-              audioDuration: ${c.audioDurationSec}
-            }"""
-        }.joinToString(",\n")
+            val clipObjsJs = clips.mapIndexed { idx, c ->
+                """{
+                  clipIndex: $idx,
+                  isImage: ${c.isImage},
+                  name: ${json.encodeToString(c.name)},
+                  width: ${c.width},
+                  height: ${c.height},
+                  videoWidth: ${c.width},
+                  videoHeight: ${c.height},
+                  naturalWidth: ${c.width},
+                  naturalHeight: ${c.height},
+                  duration: ${c.durationSec},
+                  durationSec: ${c.durationSec},
+                  hasAudio: ${c.hasAudio},
+                  audioDuration: ${c.audioDurationSec}
+                }"""
+            }.joinToString(",\n")
 
-        engine.evaluate<Any?>(
-            """
-            (function() {
-              $escapedTools
-              globalThis.__stage1Tools = typeof tools !== "undefined" ? tools : (globalThis.__stage1Tools || {});
-              globalThis.__activeEditPlan = $planJson;
-              globalThis.__activeClips = [$clipObjsJs];
-            })();
-            """.trimIndent()
-        )
-
-        val setupResult = engine.evaluate<String>(
-            """
-            (async function() {
-              const __factory = function(runtime, $toolsParam, editPlan) {
-                "use strict";
-                $pipelineCode
-                let _m = null;
-                if (typeof renderFrame === "function") _m = renderFrame;
-                else if (typeof renderScene === "function") _m = renderScene;
-                else if (typeof tools !== "undefined" && typeof tools.renderFrame === "function") _m = tools.renderFrame;
-                else if (typeof tools !== "undefined" && typeof tools.renderScene === "function") _m = tools.renderScene;
-                else if (typeof _stage1Tools !== "undefined" && typeof _stage1Tools.renderFrame === "function") _m = _stage1Tools.renderFrame;
-                else if (typeof _stage1Tools !== "undefined" && typeof _stage1Tools.renderScene === "function") _m = _stage1Tools.renderScene;
-                return {
-                  init: typeof init === "function" ? init : async () => {},
-                  renderFrame: _m
-                };
-              };
-              const exported = __factory(globalThis.runtime, globalThis.__stage1Tools || {}, globalThis.__activeEditPlan || []);
-              if (!exported.renderFrame) {
-                throw new Error("No renderFrame or renderScene function was exported in code.");
-              }
-              globalThis.__activeExported = exported;
-              globalThis.__mainCtxHandle = "__buf_main";
-              globalThis.__mainCtxObj = globalThis.__makeCtx("__buf_main");
-              await exported.init(globalThis.__activeClips);
-              return "OK";
-            })();
-            """.trimIndent()
-        )
-        if (setupResult != "OK") {
-            throw IllegalStateException("Pipeline initialization failed.")
-        }
-    }
-
-    suspend fun renderFrame(width: Int, height: Int, tSec: Float, durationSec: Float): Bitmap =
-        withContext(jsDispatcher) {
-            val engine = ensureQuickJsReady()
-            val w = width.coerceAtLeast(2)
-            val h = height.coerceAtLeast(2)
-            val surf = c2d.ensureSurface("__buf_main", w, h, preserveIfSameSize = true)
-            surf.resetState()
-            c2d.clearRect("__buf_main", 0f, 0f, w.toFloat(), h.toFloat())
-
-            engine.evaluate<Any?>(
+            q.evaluate<Any?>(
                 """
-                (async function() {
-                  const ctx = globalThis.__mainCtxObj;
-                  const fn = globalThis.__activeExported.renderFrame;
-                  const width = $w;
-                  const height = $h;
-                  const t = $tSec;
-                  const duration = $durationSec;
-                  const clips = globalThis.__activeClips || [];
-                  const runtime = globalThis.runtime;
-
-                  ctx.runtime = runtime;
-                  ctx.getCanvas = runtime.getCanvas;
-                  ctx.runShader = runtime.runShader;
-                  ctx.getFrame = runtime.getFrame;
-                  ctx.drawCover = runtime.drawCover;
-                  ctx.segmentSubject = runtime.segmentSubject;
-                  ctx.getSubjectMask = runtime.getSubjectMask;
-                  ctx.segmentMediaPipe = runtime.segmentMediaPipe;
-                  ctx.getMediaPipeMask = runtime.getMediaPipeMask;
-                  ctx.segmentSam = runtime.segmentSam;
-                  ctx.getSamMask = runtime.getSamMask;
-                  ctx.detectBoxes = runtime.detectBoxes;
-                  ctx.chromaKey = runtime.chromaKey;
-                  ctx.seekClip = runtime.seekClip;
-                  ctx.extractAudio = runtime.extractAudio;
-
-                  const fnStr = fn.toString();
-                  const match = fnStr.slice(0, 320).match(/\(([^)]*)\)/);
-                  const params = match ? match[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
-                  let ret;
-                  if (params.length > 0) {
-                    const args = [];
-                    for (let i = 0; i < params.length; i++) {
-                      const p = params[i];
-                      if (p.includes("clip") || p.includes("video") || p.includes("image") || p.includes("media") || p.includes("input") || p.includes("source")) {
-                        args.push(clips);
-                      } else if (p === "ctx" || p.includes("context")) {
-                        args.push(ctx);
-                      } else if (p === "runtime" || p.includes("helper")) {
-                        args.push(runtime);
-                      } else if (p === "w" || p.includes("width")) {
-                        args.push(width);
-                      } else if (p === "h" || p.includes("height")) {
-                        args.push(height);
-                      } else if (p === "t" || p.includes("time") || p.includes("sec")) {
-                        args.push(t);
-                      } else if (p.includes("progress")) {
-                        args.push(duration > 0 ? t / duration : 0);
-                      } else if (p === "duration" || p.includes("total") || p.includes("dur")) {
-                        args.push(duration);
-                      } else {
-                        const defaults = [ctx, width, height, t, duration, clips, runtime];
-                        args.push(defaults[i] !== undefined ? defaults[i] : null);
-                      }
-                    }
-                    ret = await fn(...args);
-                  } else {
-                    ret = await fn(ctx, width, height, t, duration, clips, runtime);
-                  }
-
-                  if (ret && ret.__handle && ret.__handle !== "__buf_main") {
-                    ctx.drawImage(ret, 0, 0, width, height);
-                  }
+                (function() {
+                  $escapedTools
+                  globalThis.__stage1Tools = typeof tools !== "undefined" ? tools : (globalThis.__stage1Tools || {});
+                  globalThis.__activeEditPlan = $planJson;
+                  globalThis.__activeClips = [$clipObjsJs];
                 })();
                 """.trimIndent()
             )
+            q
+        }
+
+        val hasToolsDecl = Regex("\\b(?:const|let|var)\\s+tools\\b").containsMatchIn(pipelineCode)
+        val toolsParam = if (hasToolsDecl) "_stage1Tools" else "tools"
+
+        evaluateAsyncJs(
+            engine,
+            """
+            const __factory = function(runtime, $toolsParam, editPlan) {
+              "use strict";
+              $pipelineCode
+              let _m = null;
+              if (typeof renderFrame === "function") _m = renderFrame;
+              else if (typeof renderScene === "function") _m = renderScene;
+              else if (typeof tools !== "undefined" && typeof tools.renderFrame === "function") _m = tools.renderFrame;
+              else if (typeof tools !== "undefined" && typeof tools.renderScene === "function") _m = tools.renderScene;
+              else if (typeof _stage1Tools !== "undefined" && typeof _stage1Tools.renderFrame === "function") _m = _stage1Tools.renderFrame;
+              else if (typeof _stage1Tools !== "undefined" && typeof _stage1Tools.renderScene === "function") _m = _stage1Tools.renderScene;
+              return {
+                init: typeof init === "function" ? init : async () => {},
+                renderFrame: _m
+              };
+            };
+            const exported = __factory(globalThis.runtime, globalThis.__stage1Tools || {}, globalThis.__activeEditPlan || []);
+            if (!exported.renderFrame) {
+              throw new Error("No renderFrame or renderScene function was exported in code.");
+            }
+            globalThis.__activeExported = exported;
+            globalThis.__mainCtxHandle = "__buf_main";
+            globalThis.__mainCtxObj = globalThis.__makeCtx("__buf_main");
+            await exported.init(globalThis.__activeClips);
+            """.trimIndent()
+        )
+    }
+
+    suspend fun renderFrame(width: Int, height: Int, tSec: Float, durationSec: Float): Bitmap {
+        val w = width.coerceAtLeast(2)
+        val h = height.coerceAtLeast(2)
+        val engine = withContext(jsDispatcher) {
+            val q = ensureQuickJsReady()
+            val surf = c2d.ensureSurface("__buf_main", w, h, preserveIfSameSize = true)
+            surf.resetState()
+            c2d.clearRect("__buf_main", 0f, 0f, w.toFloat(), h.toFloat())
+            q
+        }
+
+        evaluateAsyncJs(
+            engine,
+            """
+            const ctx = globalThis.__mainCtxObj;
+            const fn = globalThis.__activeExported.renderFrame;
+            const width = $w;
+            const height = $h;
+            const t = $tSec;
+            const duration = $durationSec;
+            const clips = globalThis.__activeClips || [];
+            const runtime = globalThis.runtime;
+
+            ctx.runtime = runtime;
+            ctx.getCanvas = runtime.getCanvas;
+            ctx.runShader = runtime.runShader;
+            ctx.getFrame = runtime.getFrame;
+            ctx.drawCover = runtime.drawCover;
+            ctx.segmentSubject = runtime.segmentSubject;
+            ctx.getSubjectMask = runtime.getSubjectMask;
+            ctx.segmentMediaPipe = runtime.segmentMediaPipe;
+            ctx.getMediaPipeMask = runtime.getMediaPipeMask;
+            ctx.segmentSam = runtime.segmentSam;
+            ctx.getSamMask = runtime.getSamMask;
+            ctx.detectBoxes = runtime.detectBoxes;
+            ctx.chromaKey = runtime.chromaKey;
+            ctx.seekClip = runtime.seekClip;
+            ctx.extractAudio = runtime.extractAudio;
+
+            const fnStr = fn.toString();
+            const match = fnStr.slice(0, 320).match(/\(([^)]*)\)/);
+            const params = match ? match[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+            let ret;
+            if (params.length > 0) {
+              const args = [];
+              for (let i = 0; i < params.length; i++) {
+                const p = params[i];
+                if (p.includes("clip") || p.includes("video") || p.includes("image") || p.includes("media") || p.includes("input") || p.includes("source")) {
+                  args.push(clips);
+                } else if (p === "ctx" || p.includes("context")) {
+                  args.push(ctx);
+                } else if (p === "runtime" || p.includes("helper")) {
+                  args.push(runtime);
+                } else if (p === "w" || p.includes("width")) {
+                  args.push(width);
+                } else if (p === "h" || p.includes("height")) {
+                  args.push(height);
+                } else if (p === "t" || p.includes("time") || p.includes("sec")) {
+                  args.push(t);
+                } else if (p.includes("progress")) {
+                  args.push(duration > 0 ? t / duration : 0);
+                } else if (p === "duration" || p.includes("total") || p.includes("dur")) {
+                  args.push(duration);
+                } else {
+                  const defaults = [ctx, width, height, t, duration, clips, runtime];
+                  args.push(defaults[i] !== undefined ? defaults[i] : null);
+                }
+              }
+              ret = await fn(...args);
+            } else {
+              ret = await fn(ctx, width, height, t, duration, clips, runtime);
+            }
+
+            if (ret && ret.__handle && ret.__handle !== "__buf_main") {
+              ctx.drawImage(ret, 0, 0, width, height);
+            }
+            """.trimIndent()
+        )
+
+        return withContext(jsDispatcher) {
             c2d.getBitmap("__buf_main") ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         }
+    }
 
     fun buildValidationProbeTimes(
         duration: Float,
@@ -670,10 +720,13 @@ class QuickJsRunner(
                 val msg = execErr.message ?: execErr::class.java.simpleName
                 onLog("Code error detected ($consecutiveErrors): $msg")
 
-                if (consecutiveErrors >= 6) {
+                if (consecutiveErrors == 6) {
                     onLog("Too many consecutive patch errors. Synthesizing guaranteed fallback baseline...")
                     currentCode = buildFallbackBaselineCode(clips.isNotEmpty())
                     continue
+                }
+                if (consecutiveErrors > 6) {
+                    throw execErr
                 }
 
                 onStatus("AI Auto-fixing code error ($consecutiveErrors)...", 0.90f)
@@ -962,6 +1015,8 @@ class QuickJsRunner(
         (args.getOrNull(idx) as? Number)?.toFloat() ?: default
 
     fun release() {
+        pendingAsyncEvals.values.forEach { it.cancel() }
+        pendingAsyncEvals.clear()
         jsExecutor.execute {
             runCatching { qjs?.close() }
             qjs = null
