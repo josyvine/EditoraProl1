@@ -320,7 +320,7 @@ fun Step1ReferencePane(
         EditoraButton(
             text = "Next: Media & AI Prompt →",
             onClick = onNextStep,
-            tone = EditoraButtonTone.SECONDARY,
+            tone = if (state.step1Done) EditoraButtonTone.PRIMARY else EditoraButtonTone.SECONDARY,
             testTag = "step1_next_button",
             modifier = Modifier.fillMaxWidth()
         )
