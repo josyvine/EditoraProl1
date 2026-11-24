@@ -11,6 +11,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import java.io.File
@@ -237,6 +238,7 @@ class GeminiClient(
         runCatching { return json.parseToJsonElement(target) }
 
         val repaired = target
+            .replace(Regex(":\\s*`([\\s\\S]*?)`(?=\\s*[,}\\]])")) { m -> ":" + json.encodeToString(m.groupValues[1]) }
             .replace(Regex(",\\s*([}\\]])"), "$1")
         return runCatching { json.parseToJsonElement(repaired) }.getOrNull()
     }
