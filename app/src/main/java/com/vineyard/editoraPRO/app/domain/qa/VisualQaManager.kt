@@ -156,7 +156,11 @@ class VisualQaManager(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (vidErr: Throwable) {
-                            onLog("QA output video encode skipped (${vidErr.message}); using 25-frame storyboard & side-by-side sheet.")
+                            val errMsg = vidErr.message.orEmpty()
+                            if (Regex("GLSL|ReferenceError|TypeError|SyntaxError|is not defined|Cannot read", RegexOption.IGNORE_CASE).containsMatchIn(errMsg)) {
+                                throw vidErr
+                            }
+                            onLog("QA output video encode skipped ($errMsg); using 25-frame storyboard & side-by-side sheet.")
                         }
                     } else {
                         onLog("Visual QA Pass $pass → Detected flat single-color frames ($avgFlatPct% uniform); skipping redundant QA video encode and forcing fix.")
@@ -343,7 +347,7 @@ class VisualQaManager(
             }
             if (passed) break
 
-            // STEP B: Code Rewrite
+            // STEP B: Code Rewrite (Restoring HTML Rules 7 & 8)
             onLog("Visual QA Pass $pass → Step B: Rewriting pipeline code from blind visual diagnosis...")
             onStatus("Visual QA Pass $pass: rewriting code to fix visual issues...", 0.86f)
             onResetStreamPhase()
@@ -376,7 +380,8 @@ class VisualQaManager(
                 "4. ASPECT RATIO & FRAMING: Return updated `aspectWidth` and `aspectHeight` in `===JSON_RESULT===` if needed.",
                 "5. COMPOSITING ISOLATION: Execute `source-in`/`destination-in` on an isolated offscreen `runtime.getCanvas('tempMask', width, height)` — NEVER on main `ctx` after drawing background!",
                 "6. ENGINE SWITCHING: If MediaPipe clipped accessories or failed on non-humans (cars, pets, anime, instruments, single person in crowd), switch cleanly to `runtime.detectBoxes` + `runtime.segmentSam` / `runtime.getSamMask`!",
-                "7. Do NOT redeclare `const tools = ...`.",
+                "7. DURATION & AUDIO: Return updated `totalDurationSec` if changed. Only call `runtime.extractAudio(...)` on video clips with `hasAudio=true` (never overwrite reference audio with silent images). Sync cuts and exponential ease-out zoom pulses to `beatsSec`/`sceneCuts`.",
+                "8. Do NOT redeclare `const tools = ...`. Declare all variables cleanly inside each `if/else` branch.",
                 "",
                 "CURRENT PIPELINE CODE TO REWRITE:",
                 activeCode,
