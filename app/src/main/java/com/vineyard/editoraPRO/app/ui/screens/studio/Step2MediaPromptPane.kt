@@ -263,7 +263,7 @@ fun Step2MediaPromptPane(
                 EditoraButton(
                     text = "Next: AI Prompt →",
                     onClick = { onSelectStep2SubStep(2) },
-                    tone = EditoraButtonTone.SECONDARY,
+                    tone = if (state.step2Done) EditoraButtonTone.PRIMARY else EditoraButtonTone.SECONDARY,
                     testTag = "step2_next_button",
                     modifier = Modifier.weight(1f)
                 )
@@ -346,7 +346,7 @@ fun Step2MediaPromptPane(
                 EditoraButton(
                     text = "Next: Render →",
                     onClick = onNextStep,
-                    tone = EditoraButtonTone.SECONDARY,
+                    tone = if (state.step2Done) EditoraButtonTone.PRIMARY else EditoraButtonTone.SECONDARY,
                     testTag = "step2_next_button",
                     modifier = Modifier.weight(1f)
                 )
@@ -453,7 +453,7 @@ private fun ClipChipCard(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "#${index + 1} ${if (clip.isImage) "IMG" else "VID"}",
+                        text = "#$index ${if (clip.isImage) "IMG" else "VID"}",
                         color = EditoraTextPrimary,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold
