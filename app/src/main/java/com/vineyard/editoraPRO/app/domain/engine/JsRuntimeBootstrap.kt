@@ -354,66 +354,195 @@ object JsRuntimeBootstrap {
             }
           };
 
-          // Lightweight OfflineAudioContext shim so AI-generated procedural synth code runs cleanly
+          // Full procedural Web Audio shim supporting parameters, ramps, oscillators & buffer sources
           globalThis.OfflineAudioContext = function(channels, length, sampleRate) {
             const sr = sampleRate || 44100;
             const len = Math.max(1, length | 0);
             const bufData = [new Float32Array(len)];
-            const scheduled = [];
+            const scheduledOscs = [];
+            const scheduledSources = [];
+
             function makeParam(initVal) {
-              return {
-                value: initVal,
+              const p = {
+                value: Number(initVal) || 0,
                 _events: [],
-                setValueAtTime: function(v, t) { this._events.push({ v, t }); },
-                linearRampToValueAtTime: function(v, t) { this._events.push({ v, t }); },
-                exponentialRampToValueAtTime: function(v, t) { this._events.push({ v, t }); }
+                setValueAtTime: function(v, t) {
+                  this._events.push({ type: "set", v: Number(v) || 0, t: Math.max(0, Number(t) || 0) });
+                  return this;
+                },
+                linearRampToValueAtTime: function(v, t) {
+                  this._events.push({ type: "linear", v: Number(v) || 0, t: Math.max(0, Number(t) || 0) });
+                  return this;
+                },
+                exponentialRampToValueAtTime: function(v, t) {
+                  this._events.push({ type: "exp", v: Math.max(0.00001, Number(v) || 0.00001), t: Math.max(0, Number(t) || 0) });
+                  return this;
+                },
+                getValAt: function(timeSec) {
+                  if (this._events.length === 0) return this.value;
+                  const evs = this._events.slice().sort((a, b) => a.t - b.t);
+                  if (timeSec <= evs[0].t) return evs[0].v;
+                  for (let i = 0; i < evs.length - 1; i++) {
+                    const e0 = evs[i];
+                    const e1 = evs[i + 1];
+                    if (timeSec >= e0.t && timeSec < e1.t) {
+                      const dt = e1.t - e0.t;
+                      if (dt <= 0.00001) return e1.v;
+                      const frac = (timeSec - e0.t) / dt;
+                      if (e1.type === "linear") {
+                        return e0.v + (e1.v - e0.v) * frac;
+                      } else if (e1.type === "exp") {
+                        const safe0 = Math.max(0.00001, e0.v);
+                        const safe1 = Math.max(0.00001, e1.v);
+                        return safe0 * Math.pow(safe1 / safe0, frac);
+                      }
+                      return e0.v;
+                    }
+                  }
+                  return evs[evs.length - 1].v;
+                }
               };
+              return p;
             }
+
             return {
               sampleRate: sr,
               destination: { _isDest: true },
               createBuffer: function(ch, l, s) {
                 const arr = new Float32Array(Math.max(1, l | 0));
-                return { sampleRate: s || sr, length: arr.length, duration: arr.length / (s || sr), numberOfChannels: ch || 1, _channels: [arr], getChannelData: () => arr };
+                return {
+                  sampleRate: s || sr,
+                  length: arr.length,
+                  duration: arr.length / (s || sr),
+                  numberOfChannels: ch || 1,
+                  _channels: [arr],
+                  getChannelData: () => arr
+                };
               },
               createGain: function() {
-                return { gain: makeParam(1), connect: function() { return this; } };
+                const node = {
+                  _type: "gain",
+                  gain: makeParam(1),
+                  _outputs: [],
+                  connect: function(dest) { if (dest) node._outputs.push(dest); return dest; }
+                };
+                return node;
               },
               createBiquadFilter: function() {
-                return { type: "lowpass", frequency: makeParam(1000), Q: makeParam(1), connect: function() { return this; } };
+                const flt = {
+                  _type: "filter",
+                  type: "lowpass",
+                  frequency: makeParam(1000),
+                  Q: makeParam(1),
+                  _outputs: [],
+                  connect: function(dest) { if (dest) flt._outputs.push(dest); return dest; }
+                };
+                return flt;
               },
               createOscillator: function() {
                 const osc = {
+                  _type: "osc",
                   type: "sine",
                   frequency: makeParam(440),
+                  _outputs: [],
                   _t0: 0,
-                  _t1: 0.2,
-                  connect: function() { return this; },
-                  start: function(t) { osc._t0 = t || 0; scheduled.push(osc); },
-                  stop: function(t) { osc._t1 = t || (osc._t0 + 0.25); }
+                  _t1: 0.25,
+                  connect: function(dest) { if (dest) osc._outputs.push(dest); return dest; },
+                  start: function(t) { osc._t0 = Math.max(0, Number(t) || 0); scheduledOscs.push(osc); },
+                  stop: function(t) { osc._t1 = Math.max(osc._t0 + 0.01, Number(t) || (osc._t0 + 0.25)); }
                 };
                 return osc;
               },
               createBufferSource: function() {
-                return { buffer: null, connect: function() {}, start: function() {}, stop: function() {} };
+                const bs = {
+                  _type: "bufferSource",
+                  buffer: null,
+                  _outputs: [],
+                  _t0: 0,
+                  _offset: 0,
+                  _duration: -1,
+                  connect: function(dest) { if (dest) bs._outputs.push(dest); return dest; },
+                  start: function(t, offset, duration) {
+                    bs._t0 = Math.max(0, Number(t) || 0);
+                    bs._offset = Math.max(0, Number(offset) || 0);
+                    bs._duration = duration !== undefined ? Number(duration) : -1;
+                    scheduledSources.push(bs);
+                  },
+                  stop: function(t) { bs._stopT = Number(t) || 0; }
+                };
+                return bs;
               },
               startRendering: async function() {
                 const out = bufData[0];
-                for (const osc of scheduled) {
+
+                function resolveNodeGain(node, timeSec) {
+                  let factor = 1.0;
+                  for (const outNode of (node._outputs || [])) {
+                    if (outNode && outNode._type === "gain") {
+                      factor *= outNode.gain.getValAt(timeSec);
+                      factor *= resolveNodeGain(outNode, timeSec);
+                    }
+                  }
+                  return factor;
+                }
+
+                // Render oscillators with continuous phase and automated frequency/gain ramps
+                for (const osc of scheduledOscs) {
                   const s0 = Math.max(0, Math.floor(osc._t0 * sr));
                   const s1 = Math.min(len, Math.floor((osc._t1 || osc._t0 + 0.25) * sr));
-                  const freq = Math.max(20, osc.frequency.value || 440);
+                  let phase = 0.0;
                   for (let i = s0; i < s1; i++) {
-                    const ph = ((i - s0) / sr) * freq;
-                    const env = Math.min(1, (i - s0) / Math.max(1, sr * 0.015)) * Math.min(1, (s1 - i) / Math.max(1, sr * 0.03));
-                    let w = Math.sin(2 * Math.PI * ph);
-                    if (osc.type === "triangle") w = 2 * Math.abs(2 * (ph - Math.floor(ph + 0.5))) - 1;
-                    else if (osc.type === "square") w = Math.sin(2 * Math.PI * ph) >= 0 ? 1 : -1;
-                    else if (osc.type === "sawtooth") w = 2 * (ph - Math.floor(ph + 0.5));
-                    out[i] = Math.max(-1, Math.min(1, out[i] + w * 0.16 * env));
+                    const curT = i / sr;
+                    const freq = Math.max(10, osc.frequency.getValAt(curT));
+                    phase += (2 * Math.PI * freq) / sr;
+                    if (phase > 2 * Math.PI) phase -= 2 * Math.PI;
+
+                    const ph = phase / (2 * Math.PI);
+                    let w = Math.sin(phase);
+                    if (osc.type === "triangle") {
+                      w = 2 * Math.abs(2 * (ph - Math.floor(ph + 0.5))) - 1;
+                    } else if (osc.type === "square") {
+                      w = Math.sin(phase) >= 0 ? 1 : -1;
+                    } else if (osc.type === "sawtooth") {
+                      w = 2 * (ph - Math.floor(ph + 0.5));
+                    }
+
+                    const env = Math.min(1, (i - s0) / Math.max(1, sr * 0.008)) *
+                                Math.min(1, (s1 - i) / Math.max(1, sr * 0.015));
+                    const gainVal = resolveNodeGain(osc, curT);
+                    out[i] = Math.max(-1, Math.min(1, out[i] + w * gainVal * 0.22 * env));
                   }
                 }
-                return { sampleRate: sr, length: len, duration: len / sr, numberOfChannels: 1, _channels: bufData, getChannelData: () => bufData[0] };
+
+                // Render buffer sources
+                for (const bs of scheduledSources) {
+                  if (!bs.buffer || !bs.buffer.getChannelData) continue;
+                  const srcData = bs.buffer.getChannelData(0);
+                  const s0 = Math.max(0, Math.floor(bs._t0 * sr));
+                  const offSamples = Math.max(0, Math.floor(bs._offset * sr));
+                  const maxSamples = bs._duration > 0
+                    ? Math.min(srcData.length - offSamples, Math.floor(bs._duration * sr))
+                    : (srcData.length - offSamples);
+                  const s1 = Math.min(len, s0 + maxSamples);
+
+                  for (let i = s0; i < s1; i++) {
+                    const curT = i / sr;
+                    const srcIdx = offSamples + (i - s0);
+                    if (srcIdx >= 0 && srcIdx < srcData.length) {
+                      const gainVal = resolveNodeGain(bs, curT);
+                      out[i] = Math.max(-1, Math.min(1, out[i] + srcData[srcIdx] * gainVal));
+                    }
+                  }
+                }
+
+                return {
+                  sampleRate: sr,
+                  length: len,
+                  duration: len / sr,
+                  numberOfChannels: 1,
+                  _channels: bufData,
+                  getChannelData: () => bufData[0]
+                };
               }
             };
           };
