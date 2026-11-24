@@ -5,9 +5,11 @@ import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.security.SecurityGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -73,8 +75,11 @@ class VertexAiService(
                     .post(payload.toRequestBody(JSON_MEDIA))
                     .build()
 
+                val call = httpClient.newCall(req)
+                val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+
                 try {
-                    httpClient.newCall(req).execute().use { resp ->
+                    call.execute().use { resp ->
                         val bodyStr = resp.body?.string().orEmpty()
                         val errMsg = extractErrorMessage(bodyStr) ?: resp.message
                         ProbeResult(cand, resp.isSuccessful, resp.code, errMsg)
@@ -82,7 +87,10 @@ class VertexAiService(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
+                    if (!coroutineContext.isActive) throw CancellationException("Cancelled by user.")
                     ProbeResult(cand, false, 0, e.message ?: "Network error")
+                } finally {
+                    cancelHandle?.dispose()
                 }
             }
         }.awaitAll()
@@ -151,6 +159,7 @@ class VertexAiService(
             .build()
 
         val call = httpClient.newCall(request)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
         val gotAnyData = AtomicBoolean(false)
 
         val watchdogThread = Thread {
@@ -244,11 +253,15 @@ class VertexAiService(
                 result
             }
         } catch (e: IOException) {
+            if (!coroutineContext.isActive) {
+                throw CancellationException("Cancelled by user.")
+            }
             if (!gotAnyData.get() && call.isCanceled()) {
                 throw GeminiHttpException(408, "Model \"$modelId\" did not respond within 90s")
             }
             throw e
         } finally {
+            cancelHandle?.dispose()
             watchdogThread.interrupt()
         }
     }
