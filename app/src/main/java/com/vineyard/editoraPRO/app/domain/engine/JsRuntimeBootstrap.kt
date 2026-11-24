@@ -481,6 +481,8 @@ object JsRuntimeBootstrap {
                     if (outNode && outNode._type === "gain") {
                       factor *= outNode.gain.getValAt(timeSec);
                       factor *= resolveNodeGain(outNode, timeSec);
+                    } else if (outNode && outNode._type === "filter") {
+                      factor *= resolveNodeGain(outNode, timeSec);
                     }
                   }
                   return factor;
