@@ -1,6 +1,7 @@
 package com.vineyard.editoraPRO.app.domain.engine
 
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -19,7 +20,7 @@ import java.util.concurrent.Executors
 /**
  * Offscreen OpenGL ES 3.0 GPU Fragment Shader Runner.
  * Supports both GLSL ES 1.00 and `#version 300 es`, auto-provides `v_uv` (0..1) and `u_resolution`,
- * binds texture Bitmaps and typed uniforms, and returns an upright ARGB_8888 Bitmap.
+ * binds texture Bitmaps and typed uniforms, and returns an upright ARGB_8888 Bitmap matching WebGL2.
  */
 class GlShaderRunner {
 
@@ -38,6 +39,10 @@ class GlShaderRunner {
     private var fboW: Int = 0
     private var fboH: Int = 0
     private var fallbackTexId: Int = 0
+
+    private var cachedReadBuf: ByteBuffer? = null
+    private var cachedFlippedBuf: ByteBuffer? = null
+    private val flipYMatrix = Matrix().apply { postScale(1f, -1f) }
 
     private data class ActiveUniform(
         val name: String,
@@ -114,7 +119,11 @@ class GlShaderRunner {
                         texturePool.add(ids[0])
                     }
                     GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texturePool[unit])
-                    GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bmp, 0)
+                    val flippedBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, flipYMatrix, false)
+                    GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, flippedBmp, 0)
+                    if (flippedBmp !== bmp) {
+                        flippedBmp.recycle()
+                    }
                 } else {
                     GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fallbackTexId)
                 }
@@ -137,18 +146,29 @@ class GlShaderRunner {
         }
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
 
-        val readBuf = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+        val bufferSize = w * h * 4
+        val readBuf = cachedReadBuf?.takeIf { it.capacity() >= bufferSize }
+            ?: ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder()).also { cachedReadBuf = it }
+        readBuf.clear()
+
         GLES30.glReadPixels(0, 0, w, h, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, readBuf)
-        readBuf.rewind()
+
+        val rowStride = w * 4
+        val flippedBuf = cachedFlippedBuf?.takeIf { it.capacity() >= bufferSize }
+            ?: ByteBuffer.allocateDirect(bufferSize).order(ByteOrder.nativeOrder()).also { cachedFlippedBuf = it }
+        flippedBuf.clear()
+
+        for (row in 0 until h) {
+            val srcOffset = (h - 1 - row) * rowStride
+            readBuf.position(srcOffset)
+            readBuf.limit(srcOffset + rowStride)
+            flippedBuf.put(readBuf)
+        }
+        flippedBuf.rewind()
 
         val rawBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        rawBitmap.copyPixelsFromBuffer(readBuf)
+        rawBitmap.copyPixelsFromBuffer(flippedBuf)
 
-        // Vertex shader maps top of texture (v=0) vs GL FBO bottom-up readback;
-        // Because Android GLUtils.texImage2D uploads top row at v=0, flipping v_uv in vertex shader
-        // OR flipping readback keeps everything upright. Here v_uv = vec2(u, 1.0 - v) isn't needed
-        // because GLUtils puts row 0 at v=0, and FBO glReadPixels reads row 0 first (bottom).
-        // Therefore FBO row 0 corresponds to UV (x, 0) -> top of input texture! So readback is ALREADY upright!
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         rawBitmap
     }
@@ -253,22 +273,6 @@ class GlShaderRunner {
             }
         }
 
-        // Flip v_uv.y to 0 at top -> 1 at bottom in WebGL-compatible orientation, OR upright:
-        // Note: GLUtils.texImage2D puts bitmap row 0 (top) at texture v=0.
-        // In FBO glReadPixels, row 0 is y_ndc = -1 (frag v_uv.y = 0).
-        // So if a_pos=(-1,-1) gives v_uv=(0,0) and we want v_uv.y=1 at top in shader math,
-        // wait: in WebGL UNPACK_FLIP_Y_WEBGL=true puts bottom at v=0, top at v=1, and gl_FragCoord/canvas reads top-down.
-        // Here in FBO + glReadPixels, row 0 of output Bitmap is y_ndc=-1!
-        // So if vertex maps y_ndc=-1 -> v_uv.y=1 (top of screen in shader!) and y_ndc=+1 -> v_uv.y=0 (bottom of screen),
-        // AND we read texture at (v_uv.x, 1.0 - v_uv.y) or keep both consistent:
-        // Wait: if y_ndc=-1 (first row read by glReadPixels = top of Bitmap!) corresponds to top of image (v=0 in GLUtils),
-        // then if vertex maps a_pos=(-1,-1) -> v_uv=(0, 1) and a_pos=(1,1) -> v_uv=(1, 0),
-        // wait: then texture(u_tex, v_uv) at top of Bitmap samples v=1 (bottom of GLUtils texture) — UPSIDE DOWN!
-        // Instead, at y_ndc=-1 (top of output Bitmap), v_uv must sample TOP of GLUtils texture (v=0) if shader does texture(u_tex, v_uv)!
-        // Let's make v_uv = a_pos * 0.5 + 0.5:
-        // At y_ndc=-1 (top of output Bitmap): v_uv.y = 0 -> GLUtils row 0 (TOP of input Bitmap)!
-        // At y_ndc=+1 (bottom of output Bitmap): v_uv.y = 1 -> GLUtils row H-1 (BOTTOM of input Bitmap)!
-        // That means BOTH texture sampling AND output Bitmap rows are 100% upright!
         val vertSrc = if (isEs300) {
             "#version 300 es\nin vec2 a_pos;\nout vec2 v_uv;\nvoid main(){\n  v_uv = a_pos * 0.5 + 0.5;\n  gl_Position = vec4(a_pos, 0.0, 1.0);\n}"
         } else {
@@ -456,6 +460,8 @@ class GlShaderRunner {
             eglDisplay = EGL14.EGL_NO_DISPLAY
             eglContext = EGL14.EGL_NO_CONTEXT
             eglSurface = EGL14.EGL_NO_SURFACE
+            cachedReadBuf = null
+            cachedFlippedBuf = null
         }
         glExecutor.shutdown()
     }
