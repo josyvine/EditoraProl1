@@ -75,7 +75,7 @@ import com.vineyard.editoraPRO.app.ui.theme.EditoraSurface2
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTerminalBg
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextMuted
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextPrimary
-import com.vineyard.editoraPRO.app.ui.theme.EditoraWarnAmber
+import com.vineyard.editoraPRO.app.ui.theme.EditoraWarn
 
 @Composable
 fun SettingsScreen(
@@ -670,6 +670,7 @@ private fun PricingSettingsPage(
                 onClick = onClearEditUsage,
                 tone = EditoraButtonTone.SECONDARY,
                 enabled = summary.totalCalls > 0,
+                testTag = "pricing_clear_edit_btn",
                 modifier = Modifier.weight(1f)
             )
             EditoraButton(
@@ -677,6 +678,7 @@ private fun PricingSettingsPage(
                 onClick = onResetLifetimeUsage,
                 tone = EditoraButtonTone.DANGER,
                 enabled = state.lifetimeTotalTokens > 0L,
+                testTag = "pricing_reset_lifetime_btn",
                 modifier = Modifier.weight(1f)
             )
         }
@@ -738,7 +740,7 @@ private fun PricingSettingsPage(
             Text(
                 text = "Tier >200K input: ${ModelPricingCatalog.formatUsd(editingRule.inputOver200kPer1M ?: editingRule.inputPer1M)} in • ${ModelPricingCatalog.formatUsd(editingRule.outputOver200kPer1M ?: editingRule.outputPer1M)} out",
                 style = EditoraMonoStyle.copy(fontSize = 10.5.sp),
-                color = EditoraWarnAmber
+                color = EditoraWarn
             )
         }
 
@@ -759,6 +761,7 @@ private fun PricingSettingsPage(
                         editingRule.outputOver200kPer1M
                     )
                 },
+                testTag = "pricing_save_rate_btn",
                 modifier = Modifier.weight(1f)
             )
             EditoraButton(
@@ -766,6 +769,7 @@ private fun PricingSettingsPage(
                 onClick = { onResetPricingOverride(editingModelId) },
                 tone = EditoraButtonTone.SECONDARY,
                 enabled = editingRule.isCustomOverride,
+                testTag = "pricing_reset_rate_btn",
                 modifier = Modifier.weight(1f)
             )
         }
@@ -928,7 +932,7 @@ private fun ApiKeyRow(
                     )
                     if (entry.isDisabled) {
                         Spacer(modifier = Modifier.width(8.dp))
-                        StatusPill(text = entry.disabledReason ?: "Disabled", tone = PillTone.ERROR)
+                        StatusPill(text = entry.disabledReason ?: "Disabled", tone = PillTone.WARN)
                     } else if (isNext) {
                         Spacer(modifier = Modifier.width(8.dp))
                         StatusPill(text = "NEXT", tone = PillTone.NEXT)
