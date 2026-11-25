@@ -66,6 +66,17 @@ class TelemetryStreamTracker(
         streamBuf.clear()
         thoughtLoggedHeader = false
         logLineCarry = ""
+        feedLines.clear()
+        feedLines.add("Waiting for stream...")
+        if (currentState.status == ProcessStatus.RUNNING) {
+            currentState = currentState.copy(
+                charCount = 0,
+                elapsedMs = System.currentTimeMillis() - startTimeMs,
+                liveFeedLines = feedLines.toList()
+            )
+            onMonitorUpdate(currentState)
+            onLiveStreamUpdate("Waiting for AI response...", ProcessStatus.RUNNING)
+        }
     }
 
     fun setStatus(text: String, progress: Float? = null) {
