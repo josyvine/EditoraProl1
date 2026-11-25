@@ -165,7 +165,8 @@ fun AppNavigation(
                                 onOpenPricingSettings = {
                                     viewModel.setSettingsSubPage(3)
                                     viewModel.setActiveTab(MainTab.SETTINGS)
-                                }
+                                },
+                                onClearCrashReport = viewModel::clearCrashReport
                             )
                             MainTab.SETTINGS -> SettingsScreen(
                                 state = state,
