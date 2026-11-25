@@ -6,7 +6,9 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.vineyard.editoraPRO.app.data.model.ApiKeyEntry
 import com.vineyard.editoraPRO.app.data.model.GeminiModelInfo
+import com.vineyard.editoraPRO.app.data.model.ModelPricingRule
 import com.vineyard.editoraPRO.app.data.model.ProviderMode
+import com.vineyard.editoraPRO.app.data.model.SectionUsageRecord
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
 import kotlinx.serialization.json.Json
 
@@ -95,6 +97,47 @@ class PreferencesManager(context: Context) {
         prefs.edit().putString(selectedModelKey(mode), modelName).apply()
     }
 
+    fun getCustomPricingOverrides(): Map<String, ModelPricingRule> {
+        val raw = prefs.getString(KEY_CUSTOM_PRICING, null) ?: return emptyMap()
+        return runCatching { json.decodeFromString<Map<String, ModelPricingRule>>(raw) }.getOrDefault(emptyMap())
+    }
+
+    fun saveCustomPricingOverrides(overrides: Map<String, ModelPricingRule>) {
+        prefs.edit().putString(KEY_CUSTOM_PRICING, json.encodeToString(overrides)).apply()
+    }
+
+    fun getEstimateCostInFreeTier(): Boolean =
+        prefs.getBoolean(KEY_ESTIMATE_FREE_TIER_COST, true)
+
+    fun setEstimateCostInFreeTier(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_ESTIMATE_FREE_TIER_COST, enabled).apply()
+    }
+
+    fun getLifetimeTotalTokens(): Long =
+        prefs.getLong(KEY_LIFETIME_TOKENS, 0L).coerceAtLeast(0L)
+
+    fun getLifetimeTotalCostUsd(): Double {
+        if (!prefs.contains(KEY_LIFETIME_COST_BITS)) return 0.0
+        val bits = prefs.getLong(KEY_LIFETIME_COST_BITS, 0L)
+        return java.lang.Double.longBitsToDouble(bits).takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+    }
+
+    fun saveLifetimeTotals(totalTokens: Long, totalCostUsd: Double) {
+        prefs.edit()
+            .putLong(KEY_LIFETIME_TOKENS, totalTokens.coerceAtLeast(0L))
+            .putLong(KEY_LIFETIME_COST_BITS, java.lang.Double.doubleToRawLongBits(totalCostUsd.coerceAtLeast(0.0)))
+            .apply()
+    }
+
+    fun getLastEditUsageRecords(): List<SectionUsageRecord> {
+        val raw = prefs.getString(KEY_LAST_EDIT_USAGE, null) ?: return emptyList()
+        return runCatching { json.decodeFromString<List<SectionUsageRecord>>(raw) }.getOrDefault(emptyList())
+    }
+
+    fun saveLastEditUsageRecords(records: List<SectionUsageRecord>) {
+        prefs.edit().putString(KEY_LAST_EDIT_USAGE, json.encodeToString(records)).apply()
+    }
+
     private fun apiKeysKey(mode: ProviderMode) =
         if (mode == ProviderMode.AI_STUDIO) "avd_aistudio_api_keys_v1" else "avd_api_keys_v1"
 
@@ -114,5 +157,10 @@ class PreferencesManager(context: Context) {
         private const val KEY_THINKING_LEVEL = "avd_aistudio_thinking_level_v1"
         private const val KEY_EXPORT_FPS = "avd_export_fps_v1"
         private const val KEY_MAX_CANVAS_EDGE = "avd_max_canvas_edge_v1"
+        private const val KEY_CUSTOM_PRICING = "avd_custom_pricing_v1"
+        private const val KEY_ESTIMATE_FREE_TIER_COST = "avd_estimate_free_tier_cost_v1"
+        private const val KEY_LIFETIME_TOKENS = "avd_lifetime_tokens_v1"
+        private const val KEY_LIFETIME_COST_BITS = "avd_lifetime_cost_bits_v1"
+        private const val KEY_LAST_EDIT_USAGE = "avd_last_edit_usage_v1"
     }
 }
