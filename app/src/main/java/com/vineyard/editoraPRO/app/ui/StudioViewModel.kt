@@ -21,6 +21,7 @@ import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ReferenceBlueprint
 import com.vineyard.editoraPRO.app.data.model.ReferenceSourceType
 import com.vineyard.editoraPRO.app.data.model.SectionUsageRecord
+import com.vineyard.editoraPRO.app.data.model.SessionDiagnosticSnapshot
 import com.vineyard.editoraPRO.app.data.model.Stage2PlanResult
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
 import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
@@ -57,12 +58,19 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private val app = application as EditoraApp
     private val prefs = app.preferencesManager
+    private val crashManager = app.crashReportManager
     private val geminiClient = app.geminiClient
     private val prettyJson = Json { prettyPrint = true; encodeDefaults = true; ignoreUnknownKeys = true }
 
     private val services = StudioServiceContainer(app) { msg -> appendLog(msg) }
     private val audioPlayer = AudioPreviewPlayer()
     private val drawMutex = Mutex()
+
+    @Volatile
+    private var currentBreadcrumbStage: String = "Idle"
+
+    @Volatile
+    private var isOperationInProgress: Boolean = false
 
     private val _uiState = MutableStateFlow(createInitialState())
     val uiState: StateFlow<AppState> = _uiState.asStateFlow()
@@ -74,7 +82,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun createInitialState(): AppState {
         val provider = prefs.getProviderMode()
-        return AppState(
+        val recoveredCrash = crashManager.loadOrRecoverCrashReport()
+        val lastSnapshot = crashManager.getLatestSnapshot()
+        val base = AppState(
             apiProvider = provider,
             thinkingLevel = prefs.getThinkingLevel(),
             apiKeys = prefs.getApiKeys(provider),
@@ -88,8 +98,56 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             customPricingOverrides = prefs.getCustomPricingOverrides(),
             estimateCostInFreeTier = prefs.getEstimateCostInFreeTier(),
             lifetimeTotalTokens = prefs.getLifetimeTotalTokens(),
-            lifetimeTotalCostUsd = prefs.getLifetimeTotalCostUsd()
+            lifetimeTotalCostUsd = prefs.getLifetimeTotalCostUsd(),
+            persistedCrashReport = recoveredCrash
         )
+        return if (recoveredCrash != null) {
+            base.copy(
+                executionLogs = recoveredCrash.executionLogsTail.ifEmpty { lastSnapshot.executionLogs }
+                    .ifEmpty { base.executionLogs },
+                liveStreamText = recoveredCrash.liveStreamTail.ifBlank { lastSnapshot.liveStreamText }
+                    .ifBlank { base.liveStreamText },
+                blueprintJsonText = recoveredCrash.blueprintJson.ifBlank { lastSnapshot.blueprintJsonText }
+                    .ifBlank { base.blueprintJsonText },
+                toolsCodeText = recoveredCrash.toolsCode.ifBlank { lastSnapshot.toolsCodeText }
+                    .ifBlank { base.toolsCodeText },
+                pipelineCodeText = recoveredCrash.pipelineCode.ifBlank { lastSnapshot.pipelineCodeText }
+                    .ifBlank { base.pipelineCodeText },
+                toastMessage = "Crash report recovered — open AI Logic to inspect.",
+                toastCounter = 1L
+            )
+        } else {
+            base
+        }
+    }
+
+    private fun syncCrashCheckpoint(
+        stage: String = currentBreadcrumbStage,
+        inProgress: Boolean = isOperationInProgress,
+        forceFlush: Boolean = false
+    ) {
+        currentBreadcrumbStage = stage
+        isOperationInProgress = inProgress
+        val st = _uiState.value
+        crashManager.updateSessionSnapshot(
+            snapshot = SessionDiagnosticSnapshot(
+                activeStage = stage,
+                inProgress = inProgress,
+                providerAndModel = "${st.apiProvider.shortLabel}: ${st.selectedModel.ifBlank { "None" }}",
+                executionLogs = st.executionLogs,
+                liveStreamText = st.liveStreamText,
+                blueprintJsonText = st.blueprintJsonText,
+                toolsCodeText = st.toolsCodeText,
+                pipelineCodeText = st.pipelineCodeText
+            ),
+            forceFlush = forceFlush
+        )
+    }
+
+    fun clearCrashReport() {
+        crashManager.clearCrashReport()
+        _uiState.update { it.copy(persistedCrashReport = null) }
+        showToast("Crash report cleared")
     }
 
     // ---- Navigation & Toast ----
@@ -154,10 +212,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val base = if (st.executionLogs.size == 1 && st.executionLogs[0].startsWith("Ready.")) emptyList() else st.executionLogs
             st.copy(executionLogs = (base + line).takeLast(400))
         }
+        syncCrashCheckpoint(forceFlush = false)
     }
 
     fun clearExecutionLog() {
         _uiState.update { it.copy(executionLogs = listOf("Log cleared.")) }
+        syncCrashCheckpoint(forceFlush = true)
     }
 
     // ---- Settings & Provider Management ----
@@ -545,6 +605,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         activeStageJob = viewModelScope.launch {
             tracker.start(this, "Preparing reference analysis...")
+            syncCrashCheckpoint("Stage 1: Reference Analysis", inProgress = true, forceFlush = true)
             try {
                 val cur = _uiState.value
                 val isYt = cur.refSourceType == ReferenceSourceType.YOUTUBE
@@ -643,6 +704,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 tracker.setStatus("Parsing blueprint & compiling AI tools...", 0.95f)
+                syncCrashCheckpoint("Stage 1: Compiling AI Tools", inProgress = true, forceFlush = true)
                 val parsed = geminiClient.parseJsonAndCodeResult(resultText, "toolsCode")
                 val blueprint = geminiClient.decodeJson(parsed.rawJson, ReferenceBlueprint())
                 val toolsJs = parsed.code.ifBlank { "const tools = {};" }
@@ -675,6 +737,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 tracker.finish(msg, success = false, showSwitchModel = isModelIssue)
                 appendLog("Stage 1 error: $msg")
                 showToast("Analysis failed: $msg")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
             }
         }
     }
@@ -682,6 +746,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun cancelActiveProcess() {
         activeStageJob?.cancel()
         activeStageJob = null
+        syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
     }
 
     // ---- Step 2: User Media, Audio & Prompts ----
@@ -834,6 +899,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         activeStageJob = viewModelScope.launch {
             tracker.start(this, "Preparing AI director edit...")
+            syncCrashCheckpoint("Stage 2: Edit Generation", inProgress = true, forceFlush = true)
             try {
                 val cur = _uiState.value
                 val hasRef = cur.refAnalysis != null
@@ -997,9 +1063,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         canvasHeight = canvasH,
                         totalDurationSec = durationSec,
                         editPlan = planJson.editPlan,
-                        blueprintJsonText = blueprintUpdate
+                        blueprintJsonText = blueprintUpdate,
+                        pipelineCodeText = parsedRes.code.ifBlank { it.pipelineCodeText }
                     )
                 }
+                syncCrashCheckpoint("Stage 2: Compile & Validate (${canvasW}x${canvasH})", inProgress = true, forceFlush = true)
 
                 val validated = services.quickJsRunner.compileAndValidateTechnical(
                     initialCode = parsedRes.code,
@@ -1036,10 +1104,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
                 var activeCode = validated.code
                 _uiState.update { it.copy(pipelineCodeText = activeCode) }
+                syncCrashCheckpoint("Stage 2: Post-Validation", inProgress = true, forceFlush = true)
 
                 var qaSkippedWarning = ""
                 if (cur.autoVisualQa) {
                     val maxQaPasses = if (cur.apiProvider == ProviderMode.AI_STUDIO) 2 else 1
+                    syncCrashCheckpoint("Stage 2: Auto Visual QA", inProgress = true, forceFlush = true)
                     try {
                         val qaOutcome = services.visualQaManager.runVisualQaSelfFix(
                             provider = cur.apiProvider,
@@ -1084,6 +1154,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                                 activeCode = nc
                                 durationSec = nd
                                 _uiState.update { it.copy(pipelineCodeText = nc, totalDurationSec = nd) }
+                                syncCrashCheckpoint("Stage 2: Auto Visual QA (updated)", inProgress = true, forceFlush = true)
                             },
                             onStatus = { s, p -> tracker.setStatus(s, p) },
                             onFeed = { f -> tracker.setFeedMessage(f) },
@@ -1114,6 +1185,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         step2Done = true
                     )
                 }
+                syncCrashCheckpoint("Stage 2: Initial Preview Render", inProgress = true, forceFlush = true)
                 drawFrameAtTime(previewStart)
 
                 if (qaSkippedWarning.isNotEmpty()) {
@@ -1131,6 +1203,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 tracker.finish(msg, success = false, showSwitchModel = isModelIssue)
                 appendLog("Stage 2 error: $msg")
                 showToast("Build failed: $msg")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
             }
         }
     }
@@ -1226,6 +1300,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
         activeStageJob = viewModelScope.launch {
             tracker.start(this, "Inspecting render...")
+            syncCrashCheckpoint("Stage 3: Manual AI Auto-Fix", inProgress = true, forceFlush = true)
             try {
                 val cur = _uiState.value
                 val hasRef = cur.refAnalysis != null
@@ -1277,6 +1352,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     },
                     onPipelineUpdated = { nc, nd ->
                         _uiState.update { it.copy(pipelineCodeText = nc, totalDurationSec = nd) }
+                        syncCrashCheckpoint("Stage 3: Manual AI Auto-Fix (updated)", inProgress = true, forceFlush = true)
                     },
                     onStatus = { s, p -> tracker.setStatus(s, p) },
                     onFeed = { f -> tracker.setFeedMessage(f) },
@@ -1305,6 +1381,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 tracker.finish(msg, false, showSwitchModel = isModelIssue)
                 appendLog("Stage 3 Auto-Fix error: $msg")
                 showToast("Auto-Fix failed: $msg")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
             }
         }
     }
@@ -1324,6 +1402,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     exportedVideoUri = null
                 )
             }
+            syncCrashCheckpoint("Stage 3: Hardware MP4 Export", inProgress = true, forceFlush = true)
             try {
                 val activeAudio = getActiveAudioBuffer()
                 appendLog("Starting deterministic hardware MP4 export (${st.canvasWidth}x${st.canvasHeight} @ ${st.exportFps}fps, audio=${activeAudio != null})...")
@@ -1359,6 +1438,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 appendLog("Export error: ${err.message}")
                 showToast("Export failed: ${err.message}")
+            } finally {
+                syncCrashCheckpoint("Idle", inProgress = false, forceFlush = true)
             }
         }
     }
@@ -1417,6 +1498,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             emptyList()
         }
 
+        val crashLines = st.persistedCrashReport?.let { crash ->
+            listOf("", crash.toFormattedText())
+        } ?: emptyList()
+
         return (listOfNotNull(
             "=== AI VIDEO DIRECTOR DIAGNOSTIC REPORT ===",
             "Generated: ${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(Date())}",
@@ -1428,7 +1513,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             "Custom Audio: ${st.customAudioName.ifBlank { "None" }}",
             "Prompt / Notes: ${st.extraNotes.trim().ifBlank { "None" }}",
             "User Media: $mediaSummary"
-        ) + usageLines + listOf(
+        ) + crashLines + usageLines + listOf(
             "",
             "--- DEEP EXECUTION LOG ---",
             st.executionLogs.joinToString("\n"),
