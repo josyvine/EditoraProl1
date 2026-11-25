@@ -101,7 +101,17 @@ data class AppState(
     val pipelineCodeText: String = "AI will synthesize the live timeline & frame renderer here after generating your edit.",
     val editPlan: List<EditPlanSegment> = emptyList(),
 
+    // Token Usage & Pricing Ledger
+    val usageRecords: List<SectionUsageRecord> = emptyList(),
+    val customPricingOverrides: Map<String, ModelPricingRule> = emptyMap(),
+    val estimateCostInFreeTier: Boolean = true,
+    val lifetimeTotalTokens: Long = 0L,
+    val lifetimeTotalCostUsd: Double = 0.0,
+
     // Toast
     val toastMessage: String? = null,
     val toastCounter: Long = 0L
-)
+) {
+    val editCostSummary: EditCostSummary
+        get() = EditCostSummary.fromRecords(usageRecords)
+}
