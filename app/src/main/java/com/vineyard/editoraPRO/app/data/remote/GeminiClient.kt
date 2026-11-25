@@ -7,6 +7,7 @@ import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.data.model.ParsedJsonAndCode
 import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
+import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -101,7 +102,8 @@ class GeminiClient(
         thinkingLevel: ThinkingLevel,
         onStatus: (String, Float?) -> Unit,
         onLog: (String) -> Unit,
-        onToken: (text: String, isThought: Boolean) -> Unit
+        onToken: (text: String, isThought: Boolean) -> Unit,
+        onUsage: (TokenUsageSnapshot) -> Unit = {}
     ): String {
         return when (provider) {
             ProviderMode.AI_STUDIO -> aiStudioService.streamGenerateContent(
@@ -111,7 +113,8 @@ class GeminiClient(
                 thinkingLevel = thinkingLevel,
                 onStatus = onStatus,
                 onLog = onLog,
-                onToken = onToken
+                onToken = onToken,
+                onUsage = onUsage
             )
             ProviderMode.VERTEX_AI -> vertexAiService.streamGenerateContent(
                 modelName = modelName,
@@ -119,13 +122,15 @@ class GeminiClient(
                 apiKey = apiKey,
                 onStatus = onStatus,
                 onLog = onLog,
-                onToken = onToken
+                onToken = onToken,
+                onUsage = onUsage
             )
         }
     }
 
     /**
-     * Executes [block] with sequential API key cycling, transient overload retry,
+     * Executes [block] with sequential API key cycling (skipping permanently disabled keys),
+     * backed-off transient overload retry + cross-key 503 rotation,
      * single-key 429 cooldown (Vertex AI), and quota/auth rotation.
      */
     suspend fun <T> runWithApiCycle(
@@ -134,6 +139,7 @@ class GeminiClient(
         updateKeys: (keys: List<ApiKeyEntry>, nextCycleIdx: Int) -> Unit,
         onStatus: (String) -> Unit,
         onLog: (String) -> Unit,
+        onRetryReset: () -> Unit = {},
         block: suspend (apiKey: String, keyNumber: Int) -> T
     ): T {
         val initialKeys = getKeys().first
@@ -141,13 +147,31 @@ class GeminiClient(
             throw IllegalStateException("Add at least one Gemini API key in Settings.")
         }
 
-        val attempts = initialKeys.size
+        val activeCount = initialKeys.count { !it.isDisabled }
+        if (activeCount == 0) {
+            throw IllegalStateException("All API keys are disabled/leaked. Add or re-enable a key in Settings.")
+        }
+
+        val attempts = activeCount
+        var overloadRotations = 0
+        val maxOverloadRotations = 3
         var lastError: Throwable? = null
 
         for (i in 0 until attempts) {
             val (currentKeys, currentIdx) = getKeys()
             if (currentKeys.isEmpty()) break
-            val idx = currentIdx % currentKeys.size
+
+            val startIdx = currentIdx % currentKeys.size
+            var idx = -1
+            for (offset in currentKeys.indices) {
+                val candIdx = (startIdx + offset) % currentKeys.size
+                if (!currentKeys[candIdx].isDisabled) {
+                    idx = candIdx
+                    break
+                }
+            }
+            if (idx == -1) break
+
             val selected = currentKeys[idx]
             val nextIdx = (idx + 1) % currentKeys.size
 
@@ -158,7 +182,8 @@ class GeminiClient(
             onLog("API Cycle → Selected Key #${idx + 1} (${selected.masked()}) [Total used: ${selected.requests + 1}]")
 
             var sameKeyTry = 0
-            while (sameKeyTry < 2) {
+            val maxOverloadSameKeyRetries = if (activeCount == 1) 2 else 1
+            while (true) {
                 try {
                     return block(selected.key, idx + 1)
                 } catch (e: CancellationException) {
@@ -170,19 +195,23 @@ class GeminiClient(
                     val isServerOverload = status in listOf(408, 500, 502, 503, 504) ||
                         Regex("503|high demand|overloaded|unavailable|stalled", RegexOption.IGNORE_CASE).containsMatchIn(msg)
 
-                    if (isServerOverload && sameKeyTry == 0) {
-                        onLog("Key #${idx + 1} transient overload ($status) → Retrying once on same key (reusing active media)...")
-                        onStatus("Server busy ($status) → Quick retry...")
-                        delay(1500)
+                    if (isServerOverload && sameKeyTry < maxOverloadSameKeyRetries) {
+                        val backoffMs = if (sameKeyTry == 0) 3500L else 7000L
+                        val backoffSec = backoffMs / 1000
+                        onLog("Key #${idx + 1} transient overload ($status) → Waiting ${backoffSec}s & retrying on same key (reusing active media)...")
+                        onStatus("Server busy ($status) → Retrying in ${backoffSec}s...")
+                        delay(backoffMs)
+                        onRetryReset()
                         sameKeyTry++
                         continue
                     }
 
                     val is429 = status == 429 || Regex("\\b429\\b").containsMatchIn(msg)
-                    if (provider == ProviderMode.VERTEX_AI && is429 && attempts == 1 && sameKeyTry == 0) {
+                    if (provider == ProviderMode.VERTEX_AI && is429 && activeCount == 1 && sameKeyTry == 0) {
                         onLog("Key #${idx + 1} rate limited (429) → Waiting 20s to cool down before retrying same key...")
                         onStatus("Quota busy (429) → Waiting 20s to cool down...")
                         delay(20_000)
+                        onRetryReset()
                         sameKeyTry++
                         continue
                     }
@@ -190,27 +219,54 @@ class GeminiClient(
                 }
             }
 
-            // Record error on key
+            // Record error on key (and flag permanently leaked/invalid keys)
+            val msg = lastError?.message.orEmpty()
+            val status = (lastError as? GeminiHttpException)?.statusCode ?: 0
+            val permanentDisableReason = when {
+                status == 403 && Regex("leaked|reported", RegexOption.IGNORE_CASE).containsMatchIn(msg) -> "Leaked (403)"
+                status in listOf(401, 403) && Regex("api key not valid|invalid api key|expired|revoked", RegexOption.IGNORE_CASE).containsMatchIn(msg) ->
+                    "Invalid ($status)"
+                else -> null
+            }
+
             val (latestKeys, latestCycle) = getKeys()
             if (idx < latestKeys.size) {
                 val errored = latestKeys.toMutableList().apply {
-                    this[idx] = this[idx].copy(errors = this[idx].errors + 1)
+                    this[idx] = this[idx].copy(
+                        errors = this[idx].errors + 1,
+                        disabledReason = permanentDisableReason ?: this[idx].disabledReason
+                    )
                 }
                 updateKeys(errored, latestCycle)
             }
 
-            val msg = lastError?.message.orEmpty()
-            val status = (lastError as? GeminiHttpException)?.statusCode ?: 0
             onLog("Key #${idx + 1} failed: $msg")
+            if (permanentDisableReason != null) {
+                onLog("Key #${idx + 1} flagged as \"$permanentDisableReason\" and will be skipped in future requests.")
+            }
 
+            val isServerOverload = status in listOf(408, 500, 502, 503, 504) ||
+                Regex("503|high demand|overloaded|unavailable|stalled", RegexOption.IGNORE_CASE).containsMatchIn(msg)
             val isKeyQuota = status in listOf(401, 403, 429) ||
                 Regex("429|quota|rate|limit|exhausted|permission|api key", RegexOption.IGNORE_CASE).containsMatchIn(msg)
 
             if (isKeyQuota && i < attempts - 1) {
-                val nextNum = ((idx + 1) % attempts) + 1
+                val nextNum = ((idx + 1) % currentKeys.size) + 1
                 onLog("Key #${idx + 1} limit/quota → Rotating to Key #$nextNum (${i + 2}/$attempts)...")
                 onStatus("Key #${idx + 1} limit → Rotating to Key #$nextNum...")
                 delay(600)
+                onRetryReset()
+                continue
+            }
+
+            if (isServerOverload && i < attempts - 1 && overloadRotations < maxOverloadRotations) {
+                overloadRotations++
+                val rotateDelayMs = 2500L + (overloadRotations * 1000L)
+                val nextNum = ((idx + 1) % currentKeys.size) + 1
+                onLog("Key #${idx + 1} still overloaded ($status) → Waiting ${rotateDelayMs / 1000}s & rotating to Key #$nextNum ($overloadRotations/$maxOverloadRotations)...")
+                onStatus("Server busy ($status) → Rotating to Key #$nextNum...")
+                delay(rotateDelayMs)
+                onRetryReset()
                 continue
             }
             break
