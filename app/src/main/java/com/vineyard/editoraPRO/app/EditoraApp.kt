@@ -4,6 +4,7 @@ import android.app.Application
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.VideoFrameDecoder
+import com.vineyard.editoraPRO.app.data.local.CrashReportManager
 import com.vineyard.editoraPRO.app.data.local.PreferencesManager
 import com.vineyard.editoraPRO.app.data.remote.GeminiClient
 import com.vineyard.editoraPRO.app.domain.engine.GlShaderRunner
@@ -23,12 +24,17 @@ class EditoraApp : Application(), ImageLoaderFactory {
         PreferencesManager(this)
     }
 
+    val crashReportManager: CrashReportManager by lazy {
+        CrashReportManager(this)
+    }
+
     val geminiClient: GeminiClient by lazy {
         GeminiClient()
     }
 
     override fun onCreate() {
         super.onCreate()
+        crashReportManager.install()
         // Evaluate integrity check cleanly at startup
         isSecurityTampered
     }
