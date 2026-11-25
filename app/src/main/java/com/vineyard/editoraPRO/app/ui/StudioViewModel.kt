@@ -14,13 +14,18 @@ import com.vineyard.editoraPRO.app.data.model.AppState
 import com.vineyard.editoraPRO.app.data.model.ClipAsset
 import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.data.model.MainTab
+import com.vineyard.editoraPRO.app.data.model.ModelPricingRule
 import com.vineyard.editoraPRO.app.data.model.PcmAudioBuffer
 import com.vineyard.editoraPRO.app.data.model.ProcessMonitorState
 import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ReferenceBlueprint
 import com.vineyard.editoraPRO.app.data.model.ReferenceSourceType
+import com.vineyard.editoraPRO.app.data.model.SectionUsageRecord
 import com.vineyard.editoraPRO.app.data.model.Stage2PlanResult
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
+import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
+import com.vineyard.editoraPRO.app.data.model.UsageStage
+import com.vineyard.editoraPRO.app.data.remote.ModelPricingCatalog
 import com.vineyard.editoraPRO.app.domain.media.BeatDetector
 import com.vineyard.editoraPRO.app.domain.media.FrameExtractor
 import com.vineyard.editoraPRO.app.domain.media.InspectionSheetBuilder
@@ -78,7 +83,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             selectedModel = prefs.getSelectedModel(provider),
             exportFps = prefs.getExportFps(),
             maxCanvasEdge = prefs.getMaxCanvasEdge(),
-            autoVisualQa = (provider == ProviderMode.AI_STUDIO)
+            autoVisualQa = (provider == ProviderMode.AI_STUDIO),
+            usageRecords = prefs.getLastEditUsageRecords(),
+            customPricingOverrides = prefs.getCustomPricingOverrides(),
+            estimateCostInFreeTier = prefs.getEstimateCostInFreeTier(),
+            lifetimeTotalTokens = prefs.getLifetimeTotalTokens(),
+            lifetimeTotalCostUsd = prefs.getLifetimeTotalCostUsd()
         )
     }
 
@@ -105,7 +115,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun setSettingsSubPage(page: Int) {
-        _uiState.update { it.copy(settingsSubPage = page.coerceIn(1, 2)) }
+        _uiState.update { it.copy(settingsSubPage = page.coerceIn(1, 3)) }
     }
 
     fun handleBackPress(): Boolean {
@@ -207,6 +217,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         showToast("API key removed")
     }
 
+    fun enableApiKey(index: Int) {
+        val st = _uiState.value
+        if (index !in st.apiKeys.indices) return
+        val updated = st.apiKeys.toMutableList().apply {
+            this[index] = this[index].copy(disabledReason = null)
+        }
+        prefs.saveApiKeys(st.apiProvider, updated)
+        _uiState.update { it.copy(apiKeys = updated) }
+        appendLog("Re-enabled API key #${index + 1} (${updated[index].masked()}).")
+        showToast("API key #${index + 1} re-enabled")
+    }
+
     fun fetchLiveModels() {
         val st = _uiState.value
         if (st.apiKeys.isEmpty()) {
@@ -274,6 +296,143 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val safe = if (edge == 720) 720 else 1080
         prefs.setMaxCanvasEdge(safe)
         _uiState.update { it.copy(maxCanvasEdge = safe) }
+    }
+
+    // ---- Token Usage & Pricing Management ----
+
+    fun setEstimateCostInFreeTier(enabled: Boolean) {
+        prefs.setEstimateCostInFreeTier(enabled)
+        _uiState.update { cur ->
+            val recalculated = recalculateRecordsCost(cur.usageRecords, cur.customPricingOverrides, enabled)
+            prefs.saveLastEditUsageRecords(recalculated)
+            cur.copy(estimateCostInFreeTier = enabled, usageRecords = recalculated)
+        }
+        showToast(if (enabled) "Showing estimated USD cost" else "Free-tier mode: USD cost set to $0")
+    }
+
+    fun saveModelPricingOverride(
+        modelId: String,
+        inputPer1M: Double,
+        outputPer1M: Double,
+        inputOver200kPer1M: Double? = null,
+        outputOver200kPer1M: Double? = null
+    ) {
+        val norm = ModelPricingCatalog.normalizeModelId(modelId)
+        if (norm.isBlank()) return
+        val (baseRule, _) = ModelPricingCatalog.resolveRule(norm)
+        val updatedRule = baseRule.copy(
+            modelId = norm,
+            inputPer1M = inputPer1M.coerceAtLeast(0.0),
+            outputPer1M = outputPer1M.coerceAtLeast(0.0),
+            inputOver200kPer1M = inputOver200kPer1M?.coerceAtLeast(0.0),
+            outputOver200kPer1M = outputOver200kPer1M?.coerceAtLeast(0.0),
+            isCustomOverride = true
+        )
+        _uiState.update { cur ->
+            val nextOverrides = cur.customPricingOverrides.toMutableMap().apply { put(norm, updatedRule) }
+            prefs.saveCustomPricingOverrides(nextOverrides)
+            val recalculated = recalculateRecordsCost(cur.usageRecords, nextOverrides, cur.estimateCostInFreeTier)
+            prefs.saveLastEditUsageRecords(recalculated)
+            cur.copy(customPricingOverrides = nextOverrides, usageRecords = recalculated)
+        }
+        appendLog("Saved custom pricing for $norm → in=${ModelPricingCatalog.formatUsd(updatedRule.inputPer1M)}/1M, out=${ModelPricingCatalog.formatUsd(updatedRule.outputPer1M)}/1M")
+        showToast("Updated pricing for $norm")
+    }
+
+    fun resetModelPricingOverride(modelId: String) {
+        val norm = ModelPricingCatalog.normalizeModelId(modelId)
+        if (norm.isBlank()) return
+        _uiState.update { cur ->
+            val nextOverrides = cur.customPricingOverrides.toMutableMap().apply { remove(norm) }
+            prefs.saveCustomPricingOverrides(nextOverrides)
+            val recalculated = recalculateRecordsCost(cur.usageRecords, nextOverrides, cur.estimateCostInFreeTier)
+            prefs.saveLastEditUsageRecords(recalculated)
+            cur.copy(customPricingOverrides = nextOverrides, usageRecords = recalculated)
+        }
+        showToast("Reset pricing for $norm to default")
+    }
+
+    fun clearCurrentEditUsage() {
+        prefs.saveLastEditUsageRecords(emptyList())
+        _uiState.update { it.copy(usageRecords = emptyList()) }
+        showToast("Current edit token ledger cleared")
+    }
+
+    fun resetLifetimeUsage() {
+        prefs.saveLifetimeTotals(0L, 0.0)
+        _uiState.update { it.copy(lifetimeTotalTokens = 0L, lifetimeTotalCostUsd = 0.0) }
+        showToast("Lifetime usage totals reset")
+    }
+
+    private fun recalculateRecordsCost(
+        records: List<SectionUsageRecord>,
+        overrides: Map<String, ModelPricingRule>,
+        estimateCost: Boolean
+    ): List<SectionUsageRecord> {
+        return records.map { rec ->
+            val snap = TokenUsageSnapshot(
+                promptTokens = rec.promptTokens,
+                candidatesTokens = rec.candidatesTokens,
+                thoughtsTokens = rec.thoughtsTokens,
+                cachedTokens = rec.cachedTokens,
+                totalTokens = rec.totalTokens
+            )
+            val calc = ModelPricingCatalog.calculateCost(rec.modelName, snap, overrides, estimateCost)
+            rec.copy(
+                inputCostUsd = calc.inputCostUsd,
+                outputCostUsd = calc.outputCostUsd,
+                totalCostUsd = calc.totalCostUsd
+            )
+        }
+    }
+
+    private fun recordTokenUsage(
+        stage: UsageStage,
+        usage: TokenUsageSnapshot,
+        isPartialFailure: Boolean = false
+    ) {
+        if (!usage.hasData) return
+        val st = _uiState.value
+        val modelName = st.selectedModel.ifBlank { "unknown" }
+        val calc = ModelPricingCatalog.calculateCost(
+            modelName = modelName,
+            usage = usage,
+            customOverrides = st.customPricingOverrides,
+            estimateCost = st.estimateCostInFreeTier
+        )
+        val rec = SectionUsageRecord(
+            id = UUID.randomUUID().toString(),
+            stage = stage,
+            modelName = ModelPricingCatalog.normalizeModelId(modelName),
+            providerLabel = st.apiProvider.shortLabel,
+            promptTokens = usage.promptTokens,
+            candidatesTokens = usage.candidatesTokens,
+            thoughtsTokens = usage.thoughtsTokens,
+            cachedTokens = usage.cachedTokens,
+            totalTokens = usage.effectiveTotalTokens,
+            inputCostUsd = calc.inputCostUsd,
+            outputCostUsd = calc.outputCostUsd,
+            totalCostUsd = calc.totalCostUsd,
+            isPartialFailure = isPartialFailure
+        )
+        _uiState.update { cur ->
+            val nextRecords = cur.usageRecords + rec
+            val nextLifetimeTokens = cur.lifetimeTotalTokens + rec.totalTokens
+            val nextLifetimeCost = cur.lifetimeTotalCostUsd + rec.totalCostUsd
+            prefs.saveLastEditUsageRecords(nextRecords)
+            prefs.saveLifetimeTotals(nextLifetimeTokens, nextLifetimeCost)
+            cur.copy(
+                usageRecords = nextRecords,
+                lifetimeTotalTokens = nextLifetimeTokens,
+                lifetimeTotalCostUsd = nextLifetimeCost
+            )
+        }
+        appendLog(
+            "Cost [${stage.label}${if (isPartialFailure) " partial" else ""}] → " +
+                "${ModelPricingCatalog.formatTokens(rec.totalTokens)} tok " +
+                "(in=${rec.promptTokens}, out=${rec.candidatesTokens}, think=${rec.thoughtsTokens}) • " +
+                ModelPricingCatalog.formatUsd(rec.totalCostUsd)
+        )
     }
 
     // ---- Step 1: Reference Input & Analysis ----
@@ -374,6 +533,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
+        prefs.saveLastEditUsageRecords(emptyList())
+        _uiState.update { it.copy(usageRecords = emptyList()) }
+
         activeStageJob?.cancel()
         val tracker = TelemetryStreamTracker(
             onMonitorUpdate = { m -> _uiState.update { it.copy(stage1Monitor = m) } },
@@ -429,7 +591,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { s -> s.copy(apiKeys = k, cycleIdx = c) }
                     },
                     onStatus = { msg -> tracker.setStatus(msg, null) },
-                    onLog = { appendLog(it) }
+                    onLog = { appendLog(it) },
+                    onRetryReset = { tracker.resetStreamPhase() }
                 ) { apiKey, _ ->
                     val parts = mutableListOf<GeminiPart>()
                     parts.add(GeminiPart.Text("PRIMARY REFERENCE VIDEO (the actual edit to reverse-engineer):"))
@@ -458,16 +621,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     parts.add(GeminiPart.Text(promptText))
 
-                    geminiClient.streamGenerateContent(
-                        provider = cur.apiProvider,
-                        modelName = cur.selectedModel,
-                        parts = parts,
-                        apiKey = apiKey,
-                        thinkingLevel = cur.thinkingLevel,
-                        onStatus = { s, p -> tracker.setStatus(s, p) },
-                        onLog = { appendLog(it) },
-                        onToken = { txt, isThought -> tracker.appendToken(txt, isThought) }
-                    )
+                    var attemptUsage: TokenUsageSnapshot? = null
+                    try {
+                        val out = geminiClient.streamGenerateContent(
+                            provider = cur.apiProvider,
+                            modelName = cur.selectedModel,
+                            parts = parts,
+                            apiKey = apiKey,
+                            thinkingLevel = cur.thinkingLevel,
+                            onStatus = { s, p -> tracker.setStatus(s, p) },
+                            onLog = { appendLog(it) },
+                            onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
+                            onUsage = { u -> attemptUsage = u }
+                        )
+                        attemptUsage?.let { recordTokenUsage(UsageStage.REFERENCE_ANALYSIS, it, isPartialFailure = false) }
+                        out
+                    } catch (e: Throwable) {
+                        attemptUsage?.let { recordTokenUsage(UsageStage.REFERENCE_ANALYSIS, it, isPartialFailure = true) }
+                        throw e
+                    }
                 }
 
                 tracker.setStatus("Parsing blueprint & compiling AI tools...", 0.95f)
@@ -647,6 +819,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             return
         }
 
+        if (st.refAnalysis == null) {
+            prefs.saveLastEditUsageRecords(emptyList())
+            _uiState.update { it.copy(usageRecords = emptyList()) }
+        }
+
         stopPlayback()
         activeStageJob?.cancel()
         val tracker = TelemetryStreamTracker(
@@ -692,7 +869,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         _uiState.update { s -> s.copy(apiKeys = k, cycleIdx = c) }
                     },
                     onStatus = { msg -> tracker.setStatus(msg, null) },
-                    onLog = { appendLog(it) }
+                    onLog = { appendLog(it) },
+                    onRetryReset = { tracker.resetStreamPhase() }
                 ) { apiKey, _ ->
                     val parts = mutableListOf<GeminiPart>(GeminiPart.Text(stage2Prompt))
                     if (hasRef) {
@@ -725,16 +903,25 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         }
                     }
                     parts.addAll(assetParts)
-                    geminiClient.streamGenerateContent(
-                        provider = cur.apiProvider,
-                        modelName = cur.selectedModel,
-                        parts = parts,
-                        apiKey = apiKey,
-                        thinkingLevel = cur.thinkingLevel,
-                        onStatus = { s, p -> tracker.setStatus(s, p) },
-                        onLog = { appendLog(it) },
-                        onToken = { txt, isThought -> tracker.appendToken(txt, isThought) }
-                    )
+                    var attemptUsage: TokenUsageSnapshot? = null
+                    try {
+                        val out = geminiClient.streamGenerateContent(
+                            provider = cur.apiProvider,
+                            modelName = cur.selectedModel,
+                            parts = parts,
+                            apiKey = apiKey,
+                            thinkingLevel = cur.thinkingLevel,
+                            onStatus = { s, p -> tracker.setStatus(s, p) },
+                            onLog = { appendLog(it) },
+                            onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
+                            onUsage = { u -> attemptUsage = u }
+                        )
+                        attemptUsage?.let { recordTokenUsage(UsageStage.EDIT_GENERATION, it, isPartialFailure = false) }
+                        out
+                    } catch (e: Throwable) {
+                        attemptUsage?.let { recordTokenUsage(UsageStage.EDIT_GENERATION, it, isPartialFailure = true) }
+                        throw e
+                    }
                 }
 
                 tracker.setStatus("Compiling & validating rendered frames...", 0.78f)
@@ -755,22 +942,32 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             _uiState.update { s -> s.copy(apiKeys = k, cycleIdx = c) }
                         },
                         onStatus = { msg -> tracker.setStatus(msg, null) },
-                        onLog = { appendLog(it) }
+                        onLog = { appendLog(it) },
+                        onRetryReset = { tracker.resetStreamPhase() }
                     ) { apiKey, _ ->
-                        geminiClient.streamGenerateContent(
-                            provider = cur.apiProvider,
-                            modelName = cur.selectedModel,
-                            parts = listOf(
-                                GeminiPart.Text(
-                                    "Re-output cleanly using:\n===JSON_RESULT===\n{\"aspectWidth\":$fbW,\"aspectHeight\":$fbH,\"totalDurationSec\":$fbDur,\"editPlan\":[]}\n===CODE_RESULT===\nasync function init(clips){}\nasync function renderFrame(ctx, width, height, t, duration, clips){...}\n\nPrevious response:\n${rawResp.take(6000)}"
-                                )
-                            ),
-                            apiKey = apiKey,
-                            thinkingLevel = cur.thinkingLevel,
-                            onStatus = { s, p -> tracker.setStatus(s, p) },
-                            onLog = { appendLog(it) },
-                            onToken = { txt, isThought -> tracker.appendToken(txt, isThought) }
-                        )
+                        var attemptUsage: TokenUsageSnapshot? = null
+                        try {
+                            val out = geminiClient.streamGenerateContent(
+                                provider = cur.apiProvider,
+                                modelName = cur.selectedModel,
+                                parts = listOf(
+                                    GeminiPart.Text(
+                                        "Re-output cleanly using:\n===JSON_RESULT===\n{\"aspectWidth\":$fbW,\"aspectHeight\":$fbH,\"totalDurationSec\":$fbDur,\"editPlan\":[]}\n===CODE_RESULT===\nasync function init(clips){}\nasync function renderFrame(ctx, width, height, t, duration, clips){...}\n\nPrevious response:\n${rawResp.take(6000)}"
+                                    )
+                                ),
+                                apiKey = apiKey,
+                                thinkingLevel = cur.thinkingLevel,
+                                onStatus = { s, p -> tracker.setStatus(s, p) },
+                                onLog = { appendLog(it) },
+                                onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
+                                onUsage = { u -> attemptUsage = u }
+                            )
+                            attemptUsage?.let { recordTokenUsage(UsageStage.EDIT_GENERATION, it, isPartialFailure = false) }
+                            out
+                        } catch (e: Throwable) {
+                            attemptUsage?.let { recordTokenUsage(UsageStage.EDIT_GENERATION, it, isPartialFailure = true) }
+                            throw e
+                        }
                     }
                     parsedRes = geminiClient.parseJsonAndCodeResult(rawResp, "renderPipelineCode")
                     planJson = geminiClient.decodeJson(parsedRes.rawJson, Stage2PlanResult())
@@ -831,7 +1028,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             onStatus = { s, p -> tracker.setStatus(s, p) },
                             onLog = { appendLog(it) },
                             onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
-                            onResetStreamPhase = { tracker.resetStreamPhase() }
+                            onResetStreamPhase = { tracker.resetStreamPhase() },
+                            onUsage = { stage, u, partial -> recordTokenUsage(stage, u, partial) }
                         )
                     }
                 )
@@ -891,7 +1089,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                             onFeed = { f -> tracker.setFeedMessage(f) },
                             onLog = { appendLog(it) },
                             onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
-                            onResetStreamPhase = { tracker.resetStreamPhase() }
+                            onResetStreamPhase = { tracker.resetStreamPhase() },
+                            onUsage = { stage, u, partial -> recordTokenUsage(stage, u, partial) }
                         )
                         activeCode = qaOutcome.finalCode
                         durationSec = qaOutcome.finalDurationSec
@@ -1083,7 +1282,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     onFeed = { f -> tracker.setFeedMessage(f) },
                     onLog = { appendLog(it) },
                     onToken = { txt, isThought -> tracker.appendToken(txt, isThought) },
-                    onResetStreamPhase = { tracker.resetStreamPhase() }
+                    onResetStreamPhase = { tracker.resetStreamPhase() },
+                    onUsage = { stage, u, partial -> recordTokenUsage(stage, u, partial) }
                 )
 
                 val safeT = min(max(0.05f, outcome.finalDurationSec - 0.05f), max(0.5f, cur.currentTimeSec))
@@ -1180,6 +1380,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun buildFullReportText(): String {
         val st = _uiState.value
+        val costSummary = st.editCostSummary
         val refDesc = when {
             st.refSourceType == ReferenceSourceType.YOUTUBE -> "YouTube URL (${st.refYoutubeUrl}, ${"%.2f".format(st.refDurationSec)}s)"
             st.refSourceType == ReferenceSourceType.FILE && st.refFile != null ->
@@ -1190,7 +1391,33 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             "#$i [${if (c.isImage) "IMG" else "VID"}] ${c.name} (${"%.1f".format(c.durationSec)}s, ${c.width}x${c.height}${if (c.hasAudio) ", audio:${"%.1f".format(c.audioDurationSec)}s" else ""})"
         }.joinToString(" | ").ifBlank { "None (Pure Procedural)" }
 
-        return listOfNotNull(
+        val usageLines = if (costSummary.byStage.isNotEmpty()) {
+            buildList {
+                add("")
+                add("--- TOKEN USAGE & PRICING SUMMARY ---")
+                costSummary.byStage.forEach { sec ->
+                    add(
+                        "${sec.stage.label} (${sec.callCount} call(s)): " +
+                            "in=${sec.promptTokens}, out=${sec.candidatesTokens}, think=${sec.thoughtsTokens}, " +
+                            "total=${sec.totalTokens} | ${ModelPricingCatalog.formatUsd(sec.totalCostUsd)}"
+                    )
+                }
+                add(
+                    "Edit Total (${costSummary.totalCalls} call(s)): " +
+                        "in=${costSummary.totalPromptTokens}, out=${costSummary.totalCandidatesTokens}, " +
+                        "think=${costSummary.totalThoughtsTokens}, total=${costSummary.totalTokens} | " +
+                        ModelPricingCatalog.formatUsd(costSummary.totalCostUsd)
+                )
+                add(
+                    "Lifetime Total: ${st.lifetimeTotalTokens} tokens | " +
+                        ModelPricingCatalog.formatUsd(st.lifetimeTotalCostUsd)
+                )
+            }
+        } else {
+            emptyList()
+        }
+
+        return (listOfNotNull(
             "=== AI VIDEO DIRECTOR DIAGNOSTIC REPORT ===",
             "Generated: ${SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(Date())}",
             "API Provider: ${if (st.apiProvider == ProviderMode.AI_STUDIO) "AI Studio (v1beta)" else "Vertex AI (Gemini Platform)"}",
@@ -1200,7 +1427,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             "Reference Source: $refDesc",
             "Custom Audio: ${st.customAudioName.ifBlank { "None" }}",
             "Prompt / Notes: ${st.extraNotes.trim().ifBlank { "None" }}",
-            "User Media: $mediaSummary",
+            "User Media: $mediaSummary"
+        ) + usageLines + listOf(
             "",
             "--- DEEP EXECUTION LOG ---",
             st.executionLogs.joinToString("\n"),
@@ -1216,7 +1444,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             "",
             "--- 3. AI-GENERATED EDIT PIPELINE (JS) ---",
             st.pipelineCodeText
-        ).joinToString("\n")
+        )).joinToString("\n")
     }
 
     fun writeReportFileAndGetUri(): Uri {
