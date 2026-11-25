@@ -161,7 +161,11 @@ fun AppNavigation(
                                 onBuildReportText = viewModel::buildFullReportText,
                                 onWriteReportUri = viewModel::writeReportFileAndGetUri,
                                 onClearExecutionLog = viewModel::clearExecutionLog,
-                                onShowToast = viewModel::showToast
+                                onShowToast = viewModel::showToast,
+                                onOpenPricingSettings = {
+                                    viewModel.setSettingsSubPage(3)
+                                    viewModel.setActiveTab(MainTab.SETTINGS)
+                                }
                             )
                             MainTab.SETTINGS -> SettingsScreen(
                                 state = state,
@@ -173,7 +177,13 @@ fun AppNavigation(
                                 onSelectThinkingLevel = viewModel::setThinkingLevel,
                                 onSelectExportFps = viewModel::setExportFps,
                                 onSelectMaxCanvasEdge = viewModel::setMaxCanvasEdge,
-                                onSelectSettingsPage = viewModel::setSettingsSubPage
+                                onSelectSettingsPage = viewModel::setSettingsSubPage,
+                                onEnableApiKey = viewModel::enableApiKey,
+                                onToggleEstimateCostInFreeTier = viewModel::setEstimateCostInFreeTier,
+                                onSavePricingOverride = viewModel::saveModelPricingOverride,
+                                onResetPricingOverride = viewModel::resetModelPricingOverride,
+                                onClearEditUsage = viewModel::clearCurrentEditUsage,
+                                onResetLifetimeUsage = viewModel::resetLifetimeUsage
                             )
                         }
                     }
