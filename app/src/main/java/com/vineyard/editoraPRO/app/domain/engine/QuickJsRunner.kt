@@ -64,6 +64,7 @@ class QuickJsRunner(
     private val retrieverCache = ConcurrentHashMap<Int, MediaMetadataRetriever>()
     private val clipSeekTimes = ConcurrentHashMap<Int, Float>()
     private val frameRingKeys = ArrayDeque<String>()
+    private val frameRingLock = Any()
     private val pendingAsyncEvals = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
     private val asyncEvalSeq = AtomicInteger(1)
 
@@ -468,8 +469,10 @@ class QuickJsRunner(
     ) {
         val engine = withContext(jsDispatcher) {
             updateClips(clips)
+            synchronized(frameRingLock) {
+                frameRingKeys.clear()
+            }
             c2d.clearAllUserBuffers()
-            frameRingKeys.clear()
             val q = ensureQuickJsReady()
             aiGeneratedAudioBuffer = null
 
@@ -777,28 +780,37 @@ class QuickJsRunner(
             is Number -> "__clip_${handleOrIdx.toInt()}"
             else -> handleOrIdx?.toString().orEmpty()
         }
-        c2d.getBitmap(raw)?.let { return it }
+        c2d.getBitmap(raw)?.takeIf { !it.isRecycled }?.let { return it }
         val clipIdx = parseClipIndex(raw) ?: return null
         val t = clipSeekTimes[clipIdx] ?: 0f
-        return extractClipBitmapSync(clipIdx, t)
+        return extractClipBitmapSync(clipIdx, t)?.takeIf { !it.isRecycled }
     }
 
     private fun resolveSourceToHandleSync(raw: String): String? {
-        if (c2d.getBitmap(raw) != null) return raw
+        if (c2d.getBitmap(raw)?.let { !it.isRecycled } == true) return raw
         val clipIdx = parseClipIndex(raw) ?: return null
         val t = clipSeekTimes[clipIdx] ?: 0f
         val qTick = (t * 24f).roundToInt()
         val key = "__frame_${clipIdx}_$qTick"
-        if (c2d.getBitmap(key) != null) return key
+        synchronized(frameRingLock) {
+            if (c2d.getBitmap(key)?.let { !it.isRecycled } == true) return key
+        }
         val bmp = extractClipBitmapSync(clipIdx, t) ?: return null
-        c2d.putBitmapAsSurface(key, bmp.copy(Bitmap.Config.ARGB_8888, true))
-        if (clipsList.getOrNull(clipIdx)?.isImage != true) {
+        val copy = if (!bmp.isRecycled) bmp.copy(Bitmap.Config.ARGB_8888, true) else null
+        if (clipsList.getOrNull(clipIdx)?.isImage != true && !bmp.isRecycled) {
             bmp.recycle()
         }
-        frameRingKeys.addLast(key)
-        while (frameRingKeys.size > 18) {
-            val oldKey = frameRingKeys.removeFirst()
-            c2d.removeSurface(oldKey)
+        if (copy == null) return null
+        synchronized(frameRingLock) {
+            c2d.putBitmapAsSurface(key, copy)
+            frameRingKeys.remove(key)
+            frameRingKeys.addLast(key)
+            while (frameRingKeys.size > 18) {
+                val oldKey = frameRingKeys.removeFirst()
+                if (oldKey != key) {
+                    c2d.removeSurface(oldKey)
+                }
+            }
         }
         return key
     }
@@ -842,19 +854,31 @@ class QuickJsRunner(
         clipSeekTimes[clipIndex] = timeSec
         val qTick = (timeSec * 24f).roundToInt()
         val ringKey = "__frame_${clipIndex}_$qTick"
-        if (c2d.getBitmap(ringKey) != null) {
-            return@withContext ringKey
+        synchronized(frameRingLock) {
+            if (c2d.getBitmap(ringKey)?.let { !it.isRecycled } == true) {
+                return@withContext ringKey
+            }
         }
         val bmp = extractClipBitmapSync(clipIndex, timeSec)
             ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
-        c2d.putBitmapAsSurface(ringKey, bmp.copy(Bitmap.Config.ARGB_8888, true))
-        if (clipsList.getOrNull(clipIndex)?.isImage != true) {
+        val copy = if (!bmp.isRecycled) {
+            bmp.copy(Bitmap.Config.ARGB_8888, true) ?: Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        } else {
+            Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        }
+        if (clipsList.getOrNull(clipIndex)?.isImage != true && !bmp.isRecycled) {
             bmp.recycle()
         }
-        frameRingKeys.addLast(ringKey)
-        while (frameRingKeys.size > 18) {
-            val oldKey = frameRingKeys.removeFirst()
-            c2d.removeSurface(oldKey)
+        synchronized(frameRingLock) {
+            c2d.putBitmapAsSurface(ringKey, copy)
+            frameRingKeys.remove(ringKey)
+            frameRingKeys.addLast(ringKey)
+            while (frameRingKeys.size > 18) {
+                val oldKey = frameRingKeys.removeFirst()
+                if (oldKey != ringKey) {
+                    c2d.removeSurface(oldKey)
+                }
+            }
         }
         ringKey
     }
@@ -870,7 +894,7 @@ class QuickJsRunner(
     ) {
         val dst = c2d.getSurface(ctxHandle) ?: return
         val srcBmp = resolveSourceToBitmap(sourceHandleOrClipIndex) ?: return
-        if (width <= 0f || height <= 0f) return
+        if (srcBmp.isRecycled || width <= 0f || height <= 0f) return
         smartSegmenter.drawCover(dst.canvas, srcBmp, x, y, width, height, zoom)
     }
 
@@ -903,12 +927,14 @@ class QuickJsRunner(
         val raw = clipIndexOrHandle?.toString().orEmpty()
         val clipIdx = parseClipIndex(raw)
         val bmp = if (clipIdx != null) extractClipBitmapSync(clipIdx, timestampSec) else resolveSourceToBitmap(raw)
-        return if (bmp != null) smartSegmenter.detectBoxes(bmp) else emptyList()
+        return if (bmp != null && !bmp.isRecycled) smartSegmenter.detectBoxes(bmp) else emptyList()
     }
 
     override suspend fun getMediaPipeMask(clipIndexOrHandle: Any?, width: Int, height: Int): MaskResult {
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        return smartSegmenter.getMediaPipeMask(bmp, width, height)
+        val safeW = width.coerceAtLeast(2)
+        val safeH = height.coerceAtLeast(2)
+        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        return smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
     }
 
     override suspend fun segmentMediaPipe(
@@ -919,10 +945,12 @@ class QuickJsRunner(
         hardEdge: Boolean,
         threshold: Float
     ): String {
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val mask = smartSegmenter.getMediaPipeMask(bmp, width, height)
+        val safeW = width.coerceAtLeast(2)
+        val safeH = height.coerceAtLeast(2)
+        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val mask = smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
         val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
-        val handle = "__seg_mp_${clipIndexOrHandle}_${width}x$height"
+        val handle = "__seg_mp_${clipIndexOrHandle}_${safeW}x$safeH"
         c2d.putBitmapAsSurface(handle, cutout)
         return handle
     }
@@ -933,8 +961,10 @@ class QuickJsRunner(
         height: Int,
         promptOpts: SamPromptOptions
     ): MaskResult {
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        return smartSegmenter.getSamMask(bmp, width, height, promptOpts)
+        val safeW = width.coerceAtLeast(2)
+        val safeH = height.coerceAtLeast(2)
+        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        return smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
     }
 
     override suspend fun segmentSam(
@@ -946,10 +976,12 @@ class QuickJsRunner(
         hardEdge: Boolean,
         threshold: Float
     ): String {
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val mask = smartSegmenter.getSamMask(bmp, width, height, promptOpts)
+        val safeW = width.coerceAtLeast(2)
+        val safeH = height.coerceAtLeast(2)
+        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val mask = smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
         val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
-        val handle = "__seg_sam_${clipIndexOrHandle}_${width}x$height"
+        val handle = "__seg_sam_${clipIndexOrHandle}_${safeW}x$safeH"
         c2d.putBitmapAsSurface(handle, cutout)
         return handle
     }
@@ -962,18 +994,20 @@ class QuickJsRunner(
         tolerance: Float,
         feather: Float
     ): String {
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val safeW = width.coerceAtLeast(2)
+        val safeH = height.coerceAtLeast(2)
+        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
         val cutout = smartSegmenter.chromaKey(
             source = bmp,
-            outW = width,
-            outH = height,
+            outW = safeW,
+            outH = safeH,
             targetR = targetRgb.getOrElse(0) { 0 },
             targetG = targetRgb.getOrElse(1) { 200 },
             targetB = targetRgb.getOrElse(2) { 0 },
             tolerance = tolerance,
             feather = feather
         )
-        val handle = "__chroma_${clipIndexOrHandle}_${width}x$height"
+        val handle = "__chroma_${clipIndexOrHandle}_${safeW}x$safeH"
         c2d.putBitmapAsSurface(handle, cutout)
         return handle
     }
@@ -1020,6 +1054,9 @@ class QuickJsRunner(
         jsExecutor.execute {
             runCatching { qjs?.close() }
             qjs = null
+            synchronized(frameRingLock) {
+                frameRingKeys.clear()
+            }
             c2d.clearAllUserBuffers()
             retrieverCache.values.forEach { runCatching { it.release() } }
             retrieverCache.clear()
