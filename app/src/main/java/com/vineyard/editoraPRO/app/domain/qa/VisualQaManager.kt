@@ -10,6 +10,8 @@ import com.vineyard.editoraPRO.app.data.model.ProviderMode
 import com.vineyard.editoraPRO.app.data.model.ReferenceBlueprint
 import com.vineyard.editoraPRO.app.data.model.ReferenceSourceType
 import com.vineyard.editoraPRO.app.data.model.ThinkingLevel
+import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
+import com.vineyard.editoraPRO.app.data.model.UsageStage
 import com.vineyard.editoraPRO.app.data.remote.GeminiClient
 import com.vineyard.editoraPRO.app.data.remote.GeminiPrompts
 import com.vineyard.editoraPRO.app.domain.engine.QuickJsRunner
@@ -73,7 +75,8 @@ class VisualQaManager(
         onFeed: (String) -> Unit,
         onLog: (String) -> Unit,
         onToken: (text: String, isThought: Boolean) -> Unit,
-        onResetStreamPhase: () -> Unit
+        onResetStreamPhase: () -> Unit,
+        onUsage: (UsageStage, TokenUsageSnapshot, Boolean) -> Unit = { _, _, _ -> }
     ): QaLoopOutcome {
         var currentW = canvasW
         var currentH = canvasH
@@ -197,7 +200,8 @@ class VisualQaManager(
                                 onStatus = onStatus,
                                 onLog = onLog,
                                 onToken = onToken,
-                                onResetStreamPhase = onResetStreamPhase
+                                onResetStreamPhase = onResetStreamPhase,
+                                onUsage = onUsage
                             )
                         }
                     )
@@ -218,7 +222,8 @@ class VisualQaManager(
                     getKeys = getKeys,
                     updateKeys = updateKeys,
                     onStatus = { msg -> onStatus(msg, null) },
-                    onLog = onLog
+                    onLog = onLog,
+                    onRetryReset = onResetStreamPhase
                 ) { apiKey, _ ->
                     val parts = mutableListOf<GeminiPart>()
                     if (hasRef) {
@@ -276,16 +281,25 @@ class VisualQaManager(
                     parts.add(GeminiPart.InlineData("image/jpeg", outBoardB64))
                     parts.add(GeminiPart.Text(promptText))
 
-                    geminiClient.streamGenerateContent(
-                        provider = provider,
-                        modelName = modelName,
-                        parts = parts,
-                        apiKey = apiKey,
-                        thinkingLevel = thinkingLevel,
-                        onStatus = onStatus,
-                        onLog = onLog,
-                        onToken = onToken
-                    )
+                    var attemptUsage: TokenUsageSnapshot? = null
+                    try {
+                        val out = geminiClient.streamGenerateContent(
+                            provider = provider,
+                            modelName = modelName,
+                            parts = parts,
+                            apiKey = apiKey,
+                            thinkingLevel = thinkingLevel,
+                            onStatus = onStatus,
+                            onLog = onLog,
+                            onToken = onToken,
+                            onUsage = { u -> attemptUsage = u }
+                        )
+                        attemptUsage?.let { onUsage(UsageStage.VISUAL_QA, it, false) }
+                        out
+                    } catch (e: Throwable) {
+                        attemptUsage?.let { onUsage(UsageStage.VISUAL_QA, it, true) }
+                        throw e
+                    }
                 }
             }
 
@@ -437,7 +451,8 @@ class VisualQaManager(
                             onStatus = onStatus,
                             onLog = onLog,
                             onToken = onToken,
-                            onResetStreamPhase = onResetStreamPhase
+                            onResetStreamPhase = onResetStreamPhase,
+                            onUsage = onUsage
                         )
                     }
                 )
@@ -479,7 +494,8 @@ class VisualQaManager(
         onStatus: (String, Float?) -> Unit,
         onLog: (String) -> Unit,
         onToken: (text: String, isThought: Boolean) -> Unit,
-        onResetStreamPhase: () -> Unit
+        onResetStreamPhase: () -> Unit,
+        onUsage: (UsageStage, TokenUsageSnapshot, Boolean) -> Unit = { _, _, _ -> }
     ): String {
         onStatus("AI Auto-fixing code error ($attempt)...", 0.90f)
         onResetStreamPhase()
@@ -515,18 +531,28 @@ class VisualQaManager(
             getKeys = getKeys,
             updateKeys = updateKeys,
             onStatus = { msg -> onStatus(msg, null) },
-            onLog = onLog
+            onLog = onLog,
+            onRetryReset = onResetStreamPhase
         ) { apiKey, _ ->
-            geminiClient.streamGenerateContent(
-                provider = provider,
-                modelName = modelName,
-                parts = listOf(GeminiPart.Text(fixPrompt)),
-                apiKey = apiKey,
-                thinkingLevel = thinkingLevel,
-                onStatus = onStatus,
-                onLog = onLog,
-                onToken = onToken
-            )
+            var attemptUsage: TokenUsageSnapshot? = null
+            try {
+                val out = geminiClient.streamGenerateContent(
+                    provider = provider,
+                    modelName = modelName,
+                    parts = listOf(GeminiPart.Text(fixPrompt)),
+                    apiKey = apiKey,
+                    thinkingLevel = thinkingLevel,
+                    onStatus = onStatus,
+                    onLog = onLog,
+                    onToken = onToken,
+                    onUsage = { u -> attemptUsage = u }
+                )
+                attemptUsage?.let { onUsage(UsageStage.TECHNICAL_FIX, it, false) }
+                out
+            } catch (e: Throwable) {
+                attemptUsage?.let { onUsage(UsageStage.TECHNICAL_FIX, it, true) }
+                throw e
+            }
         }
         val parsed = geminiClient.parseJsonAndCodeResult(fixResp, "renderPipelineCode")
         return parsed.code.ifBlank { geminiClient.stripCodeFences(fixResp) }
