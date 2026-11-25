@@ -2,6 +2,7 @@ package com.vineyard.editoraPRO.app.data.remote
 
 import com.vineyard.editoraPRO.app.data.model.GeminiModelInfo
 import com.vineyard.editoraPRO.app.data.model.GeminiPart
+import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
 import com.vineyard.editoraPRO.app.security.SecurityGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -18,6 +19,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -120,7 +122,8 @@ class VertexAiService(
         useThinkingConfig: Boolean = true,
         onStatus: (String, Float?) -> Unit,
         onLog: (String) -> Unit,
-        onToken: (text: String, isThought: Boolean) -> Unit
+        onToken: (text: String, isThought: Boolean) -> Unit,
+        onUsage: (TokenUsageSnapshot) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
         val modelId = modelName.removePrefix("models/")
         val project = SecurityGuard.getVertexProject()
@@ -189,7 +192,8 @@ class VertexAiService(
                             useThinkingConfig = false,
                             onStatus = onStatus,
                             onLog = onLog,
-                            onToken = onToken
+                            onToken = onToken,
+                            onUsage = onUsage
                         )
                     }
                     throw GeminiHttpException(resp.code, "[HTTP ${resp.code}] $errMsg")
@@ -203,6 +207,7 @@ class VertexAiService(
                 val fullOutput = StringBuilder()
                 var gotFirstToken = false
                 var chunkCount = 0
+                var latestUsage: TokenUsageSnapshot? = null
 
                 while (true) {
                     val line = source.readUtf8Line() ?: break
@@ -213,8 +218,13 @@ class VertexAiService(
                     if (payload.isEmpty() || payload == "[DONE]") continue
 
                     val chunkObj = runCatching { json.parseToJsonElement(payload).jsonObject }.getOrNull() ?: continue
+                    chunkObj["usageMetadata"]?.jsonObject?.let { um ->
+                        latestUsage = mergeUsage(latestUsage, parseUsageMetadata(um))
+                    }
+
                     val errObj = chunkObj["error"]?.jsonObject
                     if (errObj != null) {
+                        latestUsage?.takeIf { it.hasData }?.let(onUsage)
                         val code = errObj["code"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 500
                         val msg = errObj["message"]?.jsonPrimitive?.contentOrNull ?: "Stream error"
                         throw GeminiHttpException(code, "[HTTP $code] $msg")
@@ -246,6 +256,11 @@ class VertexAiService(
                     }
                 }
 
+                latestUsage?.takeIf { it.hasData }?.let { u ->
+                    onUsage(u)
+                    onLog("Tokens → in=${u.promptTokens}, out=${u.candidatesTokens}, think=${u.thoughtsTokens}, total=${u.effectiveTotalTokens}")
+                }
+
                 val totalSec = (System.nanoTime() - reqStart) / 1_000_000_000.0
                 val result = fullOutput.toString()
                 onLog("Stream completed in ${"%.2f".format(totalSec)}s ($chunkCount chunks, ${result.length} chars).")
@@ -264,6 +279,25 @@ class VertexAiService(
             cancelHandle?.dispose()
             watchdogThread.interrupt()
         }
+    }
+
+    private fun parseUsageMetadata(um: JsonObject): TokenUsageSnapshot = TokenUsageSnapshot(
+        promptTokens = um["promptTokenCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        candidatesTokens = um["candidatesTokenCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        thoughtsTokens = um["thoughtsTokenCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        cachedTokens = um["cachedContentTokenCount"]?.jsonPrimitive?.intOrNull ?: 0,
+        totalTokens = um["totalTokenCount"]?.jsonPrimitive?.intOrNull ?: 0
+    )
+
+    private fun mergeUsage(prev: TokenUsageSnapshot?, cur: TokenUsageSnapshot): TokenUsageSnapshot {
+        if (prev == null) return cur
+        return TokenUsageSnapshot(
+            promptTokens = maxOf(prev.promptTokens, cur.promptTokens),
+            candidatesTokens = maxOf(prev.candidatesTokens, cur.candidatesTokens),
+            thoughtsTokens = maxOf(prev.thoughtsTokens, cur.thoughtsTokens),
+            cachedTokens = maxOf(prev.cachedTokens, cur.cachedTokens),
+            totalTokens = maxOf(prev.totalTokens, cur.totalTokens)
+        )
     }
 
     private fun extractErrorMessage(body: String): String? {
