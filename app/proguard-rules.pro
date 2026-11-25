@@ -25,9 +25,13 @@
 # ML Runtimes & QuickJS Keep Rules
 # ==========================================
 
--keep class com.google.mediapipe.tasks.** { *; }
--keep class com.google.mediapipe.framework.** { *; }
+-keep class com.google.mediapipe.** { *; }
+-keep class com.google.protobuf.** { *; }
+-keepclassmembers class * extends com.google.protobuf.GeneratedMessageLite { *; }
+-keep class com.google.common.flogger.** { *; }
 -dontwarn com.google.mediapipe.**
+-dontwarn com.google.protobuf.**
+-dontwarn com.google.common.flogger.**
 
 -keep class ai.onnxruntime.** { *; }
 -dontwarn ai.onnxruntime.**
