@@ -15,6 +15,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.Build
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
@@ -152,9 +153,17 @@ class Canvas2dHost {
     }
 
     fun putBitmapAsSurface(handle: String, bitmap: Bitmap): BufferSurface {
-        val safeBmp = if (bitmap.config != Bitmap.Config.ARGB_8888 || !bitmap.isMutable) {
-            bitmap.copy(Bitmap.Config.ARGB_8888, true)
-        } else bitmap
+        val safeBmp = when {
+            bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0 ->
+                Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+            bitmap.config != Bitmap.Config.ARGB_8888 || !bitmap.isMutable ->
+                bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: Bitmap.createBitmap(
+                    bitmap.width.coerceAtLeast(2),
+                    bitmap.height.coerceAtLeast(2),
+                    Bitmap.Config.ARGB_8888
+                )
+            else -> bitmap
+        }
         val existing = surfaces[handle]
         if (existing != null && existing.bitmap !== safeBmp && !existing.bitmap.isRecycled) {
             existing.bitmap.recycle()
@@ -451,7 +460,10 @@ class Canvas2dHost {
         dh: Float
     ) {
         val dst = getSurface(dstHandle) ?: return
-        val srcBmp = getBitmap(srcHandle) ?: return
+        val rawSrc = getBitmap(srcHandle) ?: return
+        if (dst.bitmap.isRecycled || rawSrc.isRecycled || rawSrc.width <= 0 || rawSrc.height <= 0 || sw <= 0f || sh <= 0f || dw == 0f || dh == 0f) {
+            return
+        }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
             alpha = (dst.currentState.globalAlpha.coerceIn(0f, 1f) * 255f).roundToInt()
             porterDuffMode(dst.currentState.compositeOp)?.let { xfermode = PorterDuffXfermode(it) }
@@ -465,17 +477,30 @@ class Canvas2dHost {
             }
         }
         val srcRect = Rect(
-            sx.roundToInt().coerceIn(0, srcBmp.width - 1),
-            sy.roundToInt().coerceIn(0, srcBmp.height - 1),
-            (sx + sw).roundToInt().coerceIn(1, srcBmp.width),
-            (sy + sh).roundToInt().coerceIn(1, srcBmp.height)
+            sx.roundToInt().coerceIn(0, rawSrc.width - 1),
+            sy.roundToInt().coerceIn(0, rawSrc.height - 1),
+            (sx + sw).roundToInt().coerceIn(1, rawSrc.width),
+            (sy + sh).roundToInt().coerceIn(1, rawSrc.height)
         )
         val dstRect = RectF(dx, dy, dx + dw, dy + dh)
-        dst.canvas.drawBitmap(srcBmp, srcRect, dstRect, paint)
+        var tempSoft: Bitmap? = null
+        val drawBmp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && rawSrc.config == Bitmap.Config.HARDWARE) {
+            rawSrc.copy(Bitmap.Config.ARGB_8888, false)?.also { tempSoft = it } ?: return
+        } else {
+            rawSrc
+        }
+        try {
+            if (!dst.bitmap.isRecycled && !drawBmp.isRecycled) {
+                dst.canvas.drawBitmap(drawBmp, srcRect, dstRect, paint)
+            }
+        } finally {
+            tempSoft?.let { if (!it.isRecycled) it.recycle() }
+        }
     }
 
     fun getImageData(handle: String, x: Int, y: Int, w: Int, h: Int): ByteArray {
-        val bmp = getBitmap(handle) ?: return ByteArray(max(1, w * h * 4))
+        val bmp = getBitmap(handle)?.takeIf { !it.isRecycled && it.width > 0 && it.height > 0 }
+            ?: return ByteArray(max(1, w * h * 4))
         val safeW = w.coerceIn(1, bmp.width)
         val safeH = h.coerceIn(1, bmp.height)
         val sx = x.coerceIn(0, max(0, bmp.width - safeW))
