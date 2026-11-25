@@ -109,7 +109,10 @@ class SmartSegmenter(
                     .setOutputCategoryMask(false)
                     .build()
                 ImageSegmenter.createFromOptions(appContext, opts)
-            }.getOrNull()
+            }.getOrElse { cpuErr ->
+                onLog("CPU delegate failed for $assetName (${cpuErr.message}).")
+                null
+            }
         }
     }
 
@@ -138,7 +141,10 @@ class SmartSegmenter(
                     .setMaxResults(12)
                     .build()
                 ObjectDetector.createFromOptions(appContext, opts)
-            }.getOrNull()
+            }.getOrElse { err ->
+                onLog("Tier 2 detector load failed for $MODEL_EFFICIENTDET (${err.message}).")
+                null
+            }
             if (objectDetector != null) onLog("Tier 2 loaded: $MODEL_EFFICIENTDET")
         }
     }
@@ -199,11 +205,19 @@ class SmartSegmenter(
      */
     suspend fun getMediaPipeMask(source: Bitmap, outW: Int, outH: Int): MaskResult =
         withContext(Dispatchers.Default) {
+            val w = outW.coerceAtLeast(2)
+            val h = outH.coerceAtLeast(2)
+            if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+                onLog("Tier 1 MediaPipe skipped: invalid or recycled source bitmap.")
+                return@withContext MaskResult(w, h, FloatArray(w * h))
+            }
             ensureTier1Ready()
             inferMutex.withLock {
+                if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+                    onLog("Tier 1 MediaPipe skipped: source bitmap recycled before inference.")
+                    return@withLock MaskResult(w, h, FloatArray(w * h))
+                }
                 val startMs = SystemClock.elapsedRealtime()
-                val w = outW.coerceAtLeast(2)
-                val h = outH.coerceAtLeast(2)
                 val scaledIn = if (source.width != w || source.height != h) {
                     Bitmap.createScaledBitmap(source, w, h, true)
                 } else source
@@ -256,12 +270,13 @@ class SmartSegmenter(
                     if (scaledIn !== source) scaledIn.recycle()
                 }
 
-                if (!anyMask) {
-                    // Fallback luminance-center prior if model assets unavailable offline
-                    fused.fill(0f)
-                }
                 val elapsed = SystemClock.elapsedRealtime() - startMs
-                onLog("Tier 1 MediaPipe dual fusion (${w}x${h}) completed in ${elapsed}ms")
+                if (!anyMask) {
+                    fused.fill(0f)
+                    onLog("Tier 1 MediaPipe failed (${w}x${h}): no segmentation model loaded/active (${elapsed}ms)")
+                } else {
+                    onLog("Tier 1 MediaPipe dual fusion (${w}x${h}) completed in ${elapsed}ms")
+                }
                 MaskResult(w, h, fused)
             }
         }
@@ -270,8 +285,14 @@ class SmartSegmenter(
      * Tier 2 Step 1: EfficientDet-Lite0 zero-click 80-class COCO detector.
      */
     suspend fun detectBoxes(source: Bitmap): List<DetectedBox> = withContext(Dispatchers.Default) {
+        if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+            return@withContext emptyList()
+        }
         ensureDetectorReady()
         inferMutex.withLock {
+            if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+                return@withLock emptyList()
+            }
             val detector = objectDetector ?: return@withLock emptyList()
             val mpImage = BitmapImageBuilder(source).build()
             try {
@@ -306,9 +327,13 @@ class SmartSegmenter(
         outH: Int,
         promptOpts: SamPromptOptions
     ): MaskResult = withContext(Dispatchers.Default) {
-        ensureEdgeSamReady()
         val w = outW.coerceAtLeast(2)
         val h = outH.coerceAtLeast(2)
+        if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+            onLog("Tier 2 EdgeSAM skipped: invalid or recycled source bitmap.")
+            return@withContext MaskResult(w, h, FloatArray(w * h))
+        }
+        ensureEdgeSamReady()
 
         // Zero-click fallback: if neither boxes nor points provided, auto-detect highest-score box
         val resolvedPrompts = if (promptOpts.boxes.isEmpty() && promptOpts.points.isEmpty()) {
@@ -324,6 +349,10 @@ class SmartSegmenter(
         }
 
         inferMutex.withLock {
+            if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+                onLog("Tier 2 EdgeSAM skipped: source bitmap recycled before inference.")
+                return@withLock MaskResult(w, h, FloatArray(w * h))
+            }
             val env = ortEnv
             val enc = samEncoderSession
             val dec = samDecoderSession
@@ -507,6 +536,7 @@ class SmartSegmenter(
         h: Float,
         zoom: Float = 1f
     ) {
+        if (media.isRecycled || media.width <= 0 || media.height <= 0 || w <= 0f || h <= 0f) return
         val mw = media.width.coerceAtLeast(1).toFloat()
         val mh = media.height.coerceAtLeast(1).toFloat()
         val scale = max(w / mw, h / mh) * zoom
