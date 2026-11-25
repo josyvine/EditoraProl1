@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
@@ -41,11 +42,13 @@ import com.vineyard.editoraPRO.app.ui.theme.EditoraAccent
 import com.vineyard.editoraPRO.app.ui.theme.EditoraAccentCyan
 import com.vineyard.editoraPRO.app.ui.theme.EditoraBorder
 import com.vineyard.editoraPRO.app.ui.theme.EditoraCyanStreamText
+import com.vineyard.editoraPRO.app.ui.theme.EditoraDangerText
 import com.vineyard.editoraPRO.app.ui.theme.EditoraMonoStyle
 import com.vineyard.editoraPRO.app.ui.theme.EditoraSuccessGreen
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTerminalBg
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextMuted
 import com.vineyard.editoraPRO.app.ui.theme.EditoraTextPrimary
+import com.vineyard.editoraPRO.app.ui.theme.EditoraWarn
 
 @Composable
 fun AiLogicScreen(
@@ -55,6 +58,7 @@ fun AiLogicScreen(
     onClearExecutionLog: () -> Unit,
     onShowToast: (String) -> Unit,
     onOpenPricingSettings: () -> Unit = {},
+    onClearCrashReport: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -72,6 +76,107 @@ fun AiLogicScreen(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        // Persisted Crash & Recovery Report Card (only shown when a crash or abnormal OS kill was recorded)
+        if (state.persistedCrashReport != null) {
+            val crash = state.persistedCrashReport
+            EditoraCard {
+                CardStepHeader(
+                    stepNumber = null,
+                    title = "Persisted Crash & Recovery Report",
+                    pillText = crash.crashType,
+                    pillTone = PillTone.WARN,
+                    pillTag = "crash_report_badge"
+                )
+                Text(
+                    text = "A crash or abnormal process termination was preserved from your previous session. All pre-crash logs, stream tokens, and synthesized code have been restored below.",
+                    color = EditoraTextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp
+                )
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    color = EditoraDangerText.copy(alpha = 0.08f),
+                    border = BorderStroke(1.dp, EditoraDangerText.copy(alpha = 0.35f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "Crash Time: ${crash.timestampIso}",
+                            style = EditoraMonoStyle.copy(fontSize = 11.5.sp),
+                            color = EditoraTextPrimary
+                        )
+                        if (crash.activeStage.isNotBlank()) {
+                            Text(
+                                text = "Failed Stage: ${crash.activeStage}",
+                                style = EditoraMonoStyle.copy(fontSize = 11.5.sp, fontWeight = FontWeight.Bold),
+                                color = EditoraWarn
+                            )
+                        }
+                        if (crash.threadName.isNotBlank()) {
+                            Text(
+                                text = "Thread: ${crash.threadName}",
+                                style = EditoraMonoStyle.copy(fontSize = 11.sp),
+                                color = EditoraTextMuted
+                            )
+                        }
+                        if (crash.exceptionClass.isNotBlank() || crash.exceptionMessage.isNotBlank()) {
+                            Text(
+                                text = "${crash.exceptionClass}: ${crash.exceptionMessage}",
+                                style = EditoraMonoStyle.copy(fontSize = 11.sp),
+                                color = EditoraDangerText
+                            )
+                        }
+                        if (crash.memoryInfo.isNotBlank()) {
+                            Text(
+                                text = crash.memoryInfo,
+                                style = EditoraMonoStyle.copy(fontSize = 10.5.sp),
+                                color = EditoraAccentCyan
+                            )
+                        }
+                    }
+                }
+
+                if (crash.stackTrace.isNotBlank()) {
+                    Text(
+                        text = "Stack Trace / OS Exit Trace:",
+                        color = EditoraTextPrimary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    CodeViewer(
+                        text = crash.stackTrace,
+                        maxHeight = 220.dp,
+                        testTag = "crash_stack_trace_view"
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    EditoraButton(
+                        text = "Clear Crash Report",
+                        onClick = onClearCrashReport,
+                        tone = EditoraButtonTone.SECONDARY,
+                        testTag = "clear_crash_report_btn",
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Outlined.DeleteOutline,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    )
+                }
+            }
+        }
+
         // Diagnostic Report Card
         EditoraCard {
             Row(
