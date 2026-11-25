@@ -108,6 +108,9 @@ data class AppState(
     val lifetimeTotalTokens: Long = 0L,
     val lifetimeTotalCostUsd: Double = 0.0,
 
+    // Persisted Crash Report
+    val persistedCrashReport: PersistedCrashReport? = null,
+
     // Toast
     val toastMessage: String? = null,
     val toastCounter: Long = 0L
