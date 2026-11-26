@@ -16,8 +16,8 @@ object GeminiPrompts {
         "- await runtime.detectBoxes(mediaEl, timeSec=0) -> returns [{ label: string, score: number, box: [x,y,w,h] }] (0..1 normalized) for 80 object classes.",
         "- await runtime.getMediaPipeMask(mediaEl, w, h) -> returns raw { width, height, data: Float32Array } (0.0..1.0) of ALL humans (front, back, side & crowds).",
         "- await runtime.segmentMediaPipe(mediaEl, w, h, featherOrOpts=0.45) -> transparent cutout canvas of ALL humans.",
-        "- await runtime.getSamMask(mediaEl, w, h, promptOpts) -> promptOpts = { boxes: [[x,y,w,h], ...], points: [{x,y,label:1|0}, ...] }. Returns { width, height, data: Float32Array } (0.0..1.0).",
-        "- await runtime.segmentSam(mediaEl, w, h, promptOpts, featherOrOpts=0.45) -> transparent cutout canvas of prompted object/subject.",
+        "- await runtime.getSamMask(mediaEl, w, h, promptOpts={}) -> promptOpts = { boxes: [[x,y,w,h], ...], points: [{x,y,label:1|0}, ...] } (omit or pass {} for native zero-click auto-detection + auto-center click on the dominant foreground subject; do NOT hardcode arbitrary points). Returns { width, height, data: Float32Array } (0.0..1.0).",
+        "- await runtime.segmentSam(mediaEl, w, h, promptOpts={}, featherOrOpts=0.45) -> transparent HD cutout canvas of prompted or auto-detected subject (omit promptOpts or pass {} for native zero-click auto-click).",
         "- runtime.chromaKey(mediaEl, w, h, targetRGB=[0,200,0], tolerance=90, feather=35) -> chroma-key cutout canvas.",
         "- runtime.extractAudio(clip) -> synchronous (do NOT chain .catch() on it); returns pre-decoded AudioBuffer of clip (or null).",
         "- runtime.setAudioBuffer(audioBuffer) -> registers active audio track.",
@@ -30,11 +30,11 @@ object GeminiPrompts {
         "   - The cutout target is human (front view, back view, profile, dancers, crowds).",
         "   - Fast real-time multi-person segmentation or depth-behind-people is required.",
         "   - No external non-human accessories need to remain attached to the subject.",
-        "2. Choose EdgeSAM (`runtime.detectBoxes` + `runtime.segmentSam` / `runtime.getSamMask`) when:",
+        "2. Choose EdgeSAM (`runtime.segmentSam` / `runtime.getSamMask` with `{}` zero-click auto-prompt, or paired with `runtime.detectBoxes` for targeted multi-object scenes) when:",
         "   - The cutout target is NON-HUMAN (cars, motorcycles, pianos, guitars, pets, shoes, anime characters, products).",
         "   - The scene contains multiple people, but ONLY ONE specific individual must be isolated.",
         "   - A person is holding a complex accessory (guitar, skateboard, handbag) that MediaPipe would clip.",
-        "   - Edge refinement is required for fine curly hair or transparent clothing.",
+        "   - Edge refinement is required for fine curly hair, transparent clothing, or high-definition silhouette cutouts.",
         "3. Log your chosen engine (`maskEngine: mediapipe` or `maskEngine: edgesam`) clearly in `[LOG]` lines and execute the matching primitive on the very first generation pass!"
     ).joinToString("\n")
 }
