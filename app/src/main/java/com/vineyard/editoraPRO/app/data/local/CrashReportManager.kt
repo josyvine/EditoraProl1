@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Global Crash & Pre-Crash Diagnostic Persistence Manager.
  * - Captures uncaught JVM exceptions across all threads and flushes synchronously (fsync) before exit.
  * - Detects native crashes (SIGSEGV/SIGABRT), ANRs, and low-memory process kills on startup via
- *   ApplicationExitInfo (API 30+) or interrupted session checkpoints.
+ *   ApplicationExitInfo (API 30+) or logcat buffer dump + interrupted session checkpoints.
  * - Keeps persisted crash reports intact across restarts until explicitly cleared by the user.
  */
 class CrashReportManager(context: Context) {
@@ -109,15 +109,16 @@ class CrashReportManager(context: Context) {
         }
 
         if (snap.inProgress) {
+            val logcatDump = readSystemLogcatCrashDump()
             val fallbackKill = PersistedCrashReport(
                 id = UUID.randomUUID().toString().take(8),
                 timestampIso = formatIso(System.currentTimeMillis()),
                 timestampMs = System.currentTimeMillis(),
-                crashType = "UNEXPECTED_PROCESS_KILL",
+                crashType = if (logcatDump.isNotBlank()) "NATIVE_CRASH_LOGCAT" else "UNEXPECTED_PROCESS_KILL",
                 activeStage = snap.activeStage,
-                exceptionClass = "ProcessTerminated",
-                exceptionMessage = "App process stopped unexpectedly during '${snap.activeStage}' (likely native SIGSEGV/SIGABRT or OS low-memory kill).",
-                stackTrace = "No JVM exception was thrown; process was terminated by the OS or native runtime.",
+                exceptionClass = if (logcatDump.isNotBlank()) "NativeSignalFault" else "ProcessTerminated",
+                exceptionMessage = "App process stopped unexpectedly during '${snap.activeStage}' (likely native SIGSEGV/SIGABRT or OS termination).",
+                stackTrace = if (logcatDump.isNotBlank()) logcatDump else "No JVM exception or native logcat tombstone found; process was terminated by the OS.",
                 deviceInfo = buildDeviceInfo(),
                 memoryInfo = buildMemoryInfo(),
                 appVersion = buildAppVersion(),
@@ -204,7 +205,6 @@ class CrashReportManager(context: Context) {
 
             writeTextSync(lastExitTsFile, abnormal.timestamp.toString())
 
-            // If we already wrote a JVM uncaught crash around this exact timestamp, keep the richer JVM report
             val existing = readActiveCrashSync()
             if (existing != null &&
                 existing.crashType == "UNCAUGHT_EXCEPTION" &&
@@ -228,7 +228,8 @@ class CrashReportManager(context: Context) {
                 }
             }.getOrNull().orEmpty()
 
-            val details = buildString {
+            val logcatDump = readSystemLogcatCrashDump()
+            val combinedTrace = buildString {
                 appendLine("Exit Reason: $exitReasonLabel (status=${abnormal.status}, importance=${abnormal.importance})")
                 appendLine("PSS=${abnormal.pss / 1024} MB • RSS=${abnormal.rss / 1024} MB")
                 if (!abnormal.description.isNullOrBlank()) {
@@ -236,7 +237,13 @@ class CrashReportManager(context: Context) {
                 }
                 if (traceText.isNotBlank()) {
                     appendLine()
+                    appendLine("--- APP EXIT TRACE ---")
                     appendLine(traceText)
+                }
+                if (logcatDump.isNotBlank()) {
+                    appendLine()
+                    appendLine("--- SYSTEM LOGCAT CRASH DUMP ---")
+                    appendLine(logcatDump)
                 }
             }.trim()
 
@@ -249,7 +256,7 @@ class CrashReportManager(context: Context) {
                 activeStage = snap.activeStage,
                 exceptionClass = exitReasonLabel,
                 exceptionMessage = abnormal.description ?: "Process killed by OS during '${snap.activeStage}'.",
-                stackTrace = details,
+                stackTrace = combinedTrace,
                 deviceInfo = buildDeviceInfo(),
                 memoryInfo = buildMemoryInfo(),
                 appVersion = buildAppVersion(),
@@ -261,6 +268,20 @@ class CrashReportManager(context: Context) {
                 pipelineCode = snap.pipelineCodeText
             )
         }.getOrNull()
+    }
+
+    private fun readSystemLogcatCrashDump(): String {
+        return runCatching {
+            // Read standard logcat crash buffer or error stream to catch native .so / SIGSEGV traces
+            val process = Runtime.getRuntime().exec(arrayOf("logcat", "-b", "crash", "-d", "-t", "100"))
+            val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            if (output.isNotBlank()) {
+                output.take(12_000)
+            } else {
+                val fallbackProcess = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "150", "*:E"))
+                fallbackProcess.inputStream.bufferedReader().use { it.readText() }.trim().take(12_000)
+            }
+        }.getOrDefault("")
     }
 
     private fun readActiveCrashSync(): PersistedCrashReport? {
@@ -342,6 +363,8 @@ class CrashReportManager(context: Context) {
         }
         "${pInfo.versionName} (${PackageInfoCompat.getLongVersionCode(pInfo)})"
     }.getOrDefault("unknown")
+
+Core
 
     private fun formatIso(ms: Long): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(Date(ms))
