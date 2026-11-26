@@ -272,7 +272,6 @@ class CrashReportManager(context: Context) {
 
     private fun readSystemLogcatCrashDump(): String {
         return runCatching {
-            // Read standard logcat crash buffer or error stream to catch native .so / SIGSEGV traces
             val process = Runtime.getRuntime().exec(arrayOf("logcat", "-b", "crash", "-d", "-t", "100"))
             val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
             if (output.isNotBlank()) {
@@ -363,8 +362,6 @@ class CrashReportManager(context: Context) {
         }
         "${pInfo.versionName} (${PackageInfoCompat.getLongVersionCode(pInfo)})"
     }.getOrDefault("unknown")
-
-Core
 
     private fun formatIso(ms: Long): String =
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).format(Date(ms))
