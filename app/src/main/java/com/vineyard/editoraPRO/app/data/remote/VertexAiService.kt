@@ -1,5 +1,6 @@
 package com.vineyard.editoraPRO.app.data.remote
 
+import android.util.Base64
 import com.vineyard.editoraPRO.app.data.model.GeminiModelInfo
 import com.vineyard.editoraPRO.app.data.model.GeminiPart
 import com.vineyard.editoraPRO.app.data.model.TokenUsageSnapshot
@@ -30,6 +31,10 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.net.URLEncoder
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.PKCS8EncodedKeySpec
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -39,6 +44,97 @@ class VertexAiService(
     private val httpClient: OkHttpClient = defaultStreamingClient()
 ) {
     private val json = Json { ignoreUnknownKeys = true }
+    private val saTokenCache = ConcurrentHashMap<String, CachedToken>()
+
+    private data class CachedToken(val token: String, val expiresAtMs: Long)
+
+    private fun resolveAuth(credential: String): Pair<String, String> {
+        val clean = credential.trim()
+        if (clean.startsWith("{") && clean.contains("\"private_key\"") && clean.contains("\"client_email\"")) {
+            val token = getServiceAccountBearerToken(clean)
+            return "Authorization" to "Bearer $token"
+        }
+        if (clean.startsWith("ya29.") || clean.startsWith("Bearer ", ignoreCase = true)) {
+            val token = clean.removePrefix("Bearer ").removePrefix("bearer ").trim()
+            return "Authorization" to "Bearer $token"
+        }
+        return "x-goog-api-key" to clean
+    }
+
+    private fun getServiceAccountBearerToken(saJson: String): String {
+        val root = json.parseToJsonElement(saJson).jsonObject
+        val clientEmail = root["client_email"]?.jsonPrimitive?.contentOrNull
+            ?: throw IOException("Service Account JSON missing 'client_email'")
+        val privateKeyPem = root["private_key"]?.jsonPrimitive?.contentOrNull
+            ?: throw IOException("Service Account JSON missing 'private_key'")
+        val tokenUri = root["token_uri"]?.jsonPrimitive?.contentOrNull ?: "https://oauth2.googleapis.com/token"
+
+        val cacheKey = clientEmail
+        val cached = saTokenCache[cacheKey]
+        val now = System.currentTimeMillis()
+        if (cached != null && cached.expiresAtMs > (now + 60_000L)) {
+            return cached.token
+        }
+
+        val headerB64 = Base64.encodeToString(
+            """{"alg":"RS256","typ":"JWT"}""".toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP
+        )
+        val nowSec = now / 1000L
+        val expSec = nowSec + 3600L
+        val claimJson = """{
+            "iss":"$clientEmail",
+            "sub":"$clientEmail",
+            "aud":"$tokenUri",
+            "iat":$nowSec,
+            "exp":$expSec,
+            "scope":"https://www.googleapis.com/auth/cloud-platform"
+        }""".replace(Regex("\\s+"), "")
+
+        val claimB64 = Base64.encodeToString(
+            claimJson.toByteArray(Charsets.UTF_8),
+            Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP
+        )
+        val signedData = "$headerB64.$claimB64".toByteArray(Charsets.US_ASCII)
+
+        val cleanPem = privateKeyPem
+            .replace("-----BEGIN PRIVATE KEY-----", "")
+            .replace("-----END PRIVATE KEY-----", "")
+            .replace("\\n", "")
+            .replace(Regex("\\s+"), "")
+        val keyBytes = Base64.decode(cleanPem, Base64.DEFAULT)
+        val spec = PKCS8EncodedKeySpec(keyBytes)
+        val kf = KeyFactory.getInstance("RSA")
+        val privKey = kf.generatePrivate(spec)
+
+        val sig = Signature.getInstance("SHA256withRSA")
+        sig.initSign(privKey)
+        sig.update(signedData)
+        val sigB64 = Base64.encodeToString(
+            sig.sign(),
+            Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP
+        )
+        val jwtAssertion = "$headerB64.$claimB64.$sigB64"
+
+        val formBody = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=$jwtAssertion"
+        val req = Request.Builder()
+            .url(tokenUri)
+            .post(formBody.toRequestBody("application/x-www-form-urlencoded".toMediaType()))
+            .build()
+
+        val tokenResp = httpClient.newCall(req).execute()
+        val tokenBody = tokenResp.body?.string().orEmpty()
+        if (!tokenResp.isSuccessful) {
+            throw IOException("Failed to obtain OAuth2 token from Service Account: [HTTP ${tokenResp.code}] $tokenBody")
+        }
+
+        val parsed = json.parseToJsonElement(tokenBody).jsonObject
+        val accessToken = parsed["access_token"]?.jsonPrimitive?.contentOrNull
+            ?: throw IOException("Token response missing 'access_token'")
+        val expiresInSec = parsed["expires_in"]?.jsonPrimitive?.intOrNull ?: 3600
+        saTokenCache[cacheKey] = CachedToken(accessToken, now + (expiresInSec * 1000L))
+        return accessToken
+    }
 
     suspend fun fetchLiveModels(
         apiKey: String,
@@ -47,7 +143,8 @@ class VertexAiService(
         val project = SecurityGuard.getVertexProject()
         val location = SecurityGuard.getVertexLocation()
         val base = SecurityGuard.getVertexBaseUrl()
-        onLog("Probing live Gemini Platform models on $project/$location via :countTokens...")
+        val (headerName, headerVal) = resolveAuth(apiKey)
+        onLog("Probing live Gemini Platform models on $project/$location via :countTokens ($headerName)...")
 
         data class ProbeResult(
             val cand: GeminiModelInfo,
@@ -73,7 +170,7 @@ class VertexAiService(
                 val req = Request.Builder()
                     .url(url)
                     .header("Content-Type", "application/json")
-                    .header("x-goog-api-key", apiKey)
+                    .header(headerName, headerVal)
                     .post(payload.toRequestBody(JSON_MEDIA))
                     .build()
 
@@ -130,6 +227,7 @@ class VertexAiService(
         val location = SecurityGuard.getVertexLocation()
         val base = SecurityGuard.getVertexBaseUrl()
         val url = "$base/${URLEncoder.encode(modelId, "UTF-8")}:streamGenerateContent?alt=sse"
+        val (headerName, headerVal) = resolveAuth(apiKey)
 
         val genCfg = buildJsonObject {
             put("temperature", 0.2)
@@ -151,13 +249,13 @@ class VertexAiService(
         }.toString()
 
         val reqStart = System.nanoTime()
-        onLog("POST $project/$location/models/$modelId:streamGenerateContent?alt=sse (thoughts=$useThinkingConfig)")
+        onLog("POST $project/$location/models/$modelId:streamGenerateContent?alt=sse (thoughts=$useThinkingConfig, auth=$headerName)")
         onStatus("Requesting $modelId...", 0.42f)
 
         val request = Request.Builder()
             .url(url)
             .header("Content-Type", "application/json")
-            .header("x-goog-api-key", apiKey)
+            .header(headerName, headerVal)
             .post(bodyJson.toRequestBody(JSON_MEDIA))
             .build()
 
