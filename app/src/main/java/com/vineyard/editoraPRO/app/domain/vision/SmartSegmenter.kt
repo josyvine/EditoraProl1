@@ -258,7 +258,12 @@ class SmartSegmenter(
                     return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
                 val startMs = SystemClock.elapsedRealtime()
-                val scaledIn = createCoverBitmap(source, w, h)
+                val scaledIn = if (source.width != w || source.height != h) {
+                    createCoverBitmap(source, w, h)
+                } else {
+                    source.copy(Bitmap.Config.ARGB_8888, false)
+                        ?: return@withLock MaskResult(w, h, FloatArray(w * h))
+                }
 
                 val mpImage = BitmapImageBuilder(scaledIn).build()
                 val fused = FloatArray(w * h)
@@ -305,7 +310,7 @@ class SmartSegmenter(
                     }
                 } finally {
                     mpImage.close()
-                    if (scaledIn !== source) scaledIn.recycle()
+                    if (scaledIn !== source && !scaledIn.isRecycled) scaledIn.recycle()
                 }
 
                 val elapsed = SystemClock.elapsedRealtime() - startMs
@@ -332,11 +337,13 @@ class SmartSegmenter(
                 return@withLock emptyList()
             }
             val detector = objectDetector ?: return@withLock emptyList()
-            val mpImage = BitmapImageBuilder(source).build()
+            val detInput = source.copy(Bitmap.Config.ARGB_8888, false)
+                ?: return@withLock emptyList()
+            val mpImage = BitmapImageBuilder(detInput).build()
             try {
                 val result = detector.detect(mpImage)
-                val imgW = source.width.coerceAtLeast(1).toFloat()
-                val imgH = source.height.coerceAtLeast(1).toFloat()
+                val imgW = detInput.width.coerceAtLeast(1).toFloat()
+                val imgH = detInput.height.coerceAtLeast(1).toFloat()
                 result.detections().mapNotNull { det ->
                     val cat = det.categories().firstOrNull() ?: return@mapNotNull null
                     val box = det.boundingBox()
@@ -352,6 +359,7 @@ class SmartSegmenter(
                 }
             } finally {
                 mpImage.close()
+                if (!detInput.isRecycled) detInput.recycle()
             }
         }
     }
