@@ -6,9 +6,7 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Rect
 import android.os.SystemClock
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.ByteBufferExtractor
@@ -193,6 +191,55 @@ class SmartSegmenter(
         return out
     }
 
+    private fun mapPromptsToCover(
+        opts: SamPromptOptions,
+        srcW: Int,
+        srcH: Int,
+        dstW: Int,
+        dstH: Int
+    ): SamPromptOptions {
+        if (srcW == dstW && srcH == dstH) return opts
+        val sw = srcW.coerceAtLeast(1).toFloat()
+        val sh = srcH.coerceAtLeast(1).toFloat()
+        val dwF = dstW.toFloat()
+        val dhF = dstH.toFloat()
+        val scale = max(dwF / sw, dhF / sh)
+        val scaledW = sw * scale
+        val scaledH = sh * scale
+        val offX = (dwF - scaledW) * 0.5f
+        val offY = (dhF - scaledH) * 0.5f
+
+        val mappedBoxes = opts.boxes.mapNotNull { b ->
+            if (b.size < 4) return@mapNotNull null
+            val rawX0 = (b[0] * scaledW + offX) / dwF
+            val rawY0 = (b[1] * scaledH + offY) / dhF
+            val rawX1 = ((b[0] + b[2]) * scaledW + offX) / dwF
+            val rawY1 = ((b[1] + b[3]) * scaledH + offY) / dhF
+            if (rawX1 <= 0f || rawX0 >= 1f || rawY1 <= 0f || rawY0 >= 1f) {
+                return@mapNotNull null
+            }
+            val x0 = rawX0.coerceIn(0f, 1f)
+            val y0 = rawY0.coerceIn(0f, 1f)
+            val x1 = rawX1.coerceIn(0f, 1f)
+            val y1 = rawY1.coerceIn(0f, 1f)
+            val bw = (x1 - x0).coerceAtLeast(0f)
+            val bh = (y1 - y0).coerceAtLeast(0f)
+            if (bw > 0.005f && bh > 0.005f) listOf(x0, y0, bw, bh) else null
+        }
+
+        val mappedPoints = opts.points.mapNotNull { p ->
+            val px = (p.x * scaledW + offX) / dwF
+            val py = (p.y * scaledH + offY) / dhF
+            if (px in -0.05f..1.05f && py in -0.05f..1.05f) {
+                SamPointPrompt(px.coerceIn(0f, 1f), py.coerceIn(0f, 1f), p.label)
+            } else {
+                null
+            }
+        }
+
+        return SamPromptOptions(boxes = mappedBoxes, points = mappedPoints)
+    }
+
     /**
      * Tier 1: Dual MediaPipe human segmentation (DeepLab-v3 class 15 + Selfie Multiclass inverted class 0).
      */
@@ -310,7 +357,7 @@ class SmartSegmenter(
     }
 
     /**
-     * Tier 2 Step 2 & 3: EdgeSAM ONNX Encoder + Decoder (with subject-agnostic zero-click auto-prompting).
+     * Tier 2 Step 2 & 3: EdgeSAM ONNX Encoder + Decoder (aspect-agnostic & subject-agnostic).
      */
     suspend fun getSamMask(
         source: Bitmap,
@@ -327,12 +374,9 @@ class SmartSegmenter(
         ensureEdgeSamReady()
 
         val hasExplicitPrompts = promptOpts.boxes.isNotEmpty() || promptOpts.points.isNotEmpty()
-        // When auto-prompting, align source using cover-crop to match applyMaskToCutout geometry 1:1
-        val workBmp = if (!hasExplicitPrompts) createCoverBitmap(source, w, h) else source
+        val workBmp = createCoverBitmap(source, w, h)
 
         try {
-            // Zero-click auto-prompt: subject-agnostic salience box + dynamic center click,
-            // falling back to Tier-1 foreground centroid if detector finds no boxes.
             val resolvedPrompts = if (!hasExplicitPrompts) {
                 val detected = detectBoxes(workBmp)
                 val best = detected.maxByOrNull { det ->
@@ -357,7 +401,11 @@ class SmartSegmenter(
                     deriveAutoPromptFromMask(workBmp)
                 }
             } else {
-                promptOpts
+                mapPromptsToCover(promptOpts, source.width, source.height, w, h)
+            }
+
+            if (resolvedPrompts.boxes.isEmpty() && resolvedPrompts.points.isEmpty()) {
+                return@withContext MaskResult(w, h, FloatArray(w * h))
             }
 
             inferMutex.withLock {
@@ -434,7 +482,6 @@ class SmartSegmenter(
                     labelsList.add(pt.label.toFloat())
                 }
                 if (resolvedPrompts.boxes.isEmpty() && resolvedPrompts.points.isNotEmpty()) {
-                    // Standard SAM padding point when only point prompts are used
                     coordsList.add(0f); coordsList.add(0f); labelsList.add(-1f)
                 }
 
@@ -462,7 +509,6 @@ class SmartSegmenter(
                     }
 
                     dec.run(decInputs).use { decRes ->
-                        // Find best mask index from iou_predictions / scores if present
                         var bestMaskIdx = 0
                         var maskTensor: OnnxTensor? = null
                         for ((idx, entry) in decRes.withIndex()) {
