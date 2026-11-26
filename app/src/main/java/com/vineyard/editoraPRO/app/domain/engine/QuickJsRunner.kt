@@ -50,6 +50,11 @@ class QuickJsRunner(
     private val onLog: (String) -> Unit
 ) : NativeRuntimeApi {
 
+    private data class ResolvedBitmap(
+        val bitmap: Bitmap,
+        val isTemporary: Boolean
+    )
+
     private val jsExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "Editora-QuickJS").apply { isDaemon = true }
     }
@@ -67,6 +72,10 @@ class QuickJsRunner(
     private val frameRingLock = Any()
     private val pendingAsyncEvals = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
     private val asyncEvalSeq = AtomicInteger(1)
+    private val frameCutoutSeq = AtomicInteger(0)
+    private val initCutoutSeq = AtomicInteger(0)
+    @Volatile
+    private var isRenderingFrame: Boolean = false
 
     @Volatile
     var aiGeneratedAudioBuffer: PcmAudioBuffer? = null
@@ -401,8 +410,10 @@ class QuickJsRunner(
                 mapOf("width" to mask.width, "height" to mask.height, "bytes" to floatArrayToBytes(mask.data))
             }
             asyncFunction("segmentSam") { args ->
-                val promptOpts = parsePromptOpts(args.getOrNull(3))
-                val feather = num(args, 4, 0.45f)
+                val rawArg3 = args.getOrNull(3)
+                val promptOpts = parsePromptOpts(rawArg3)
+                val defaultFeather = if (rawArg3 is Number) rawArg3.toFloat() else 0.45f
+                val feather = num(args, 4, defaultFeather)
                 val hardEdge = (args.getOrNull(5) as? Boolean) ?: false
                 val threshold = num(args, 6, 0.5f)
                 segmentSam(str(args, 0), num(args, 1, 2f).toInt(), num(args, 2, 2f).toInt(), promptOpts, feather, hardEdge, threshold)
@@ -468,6 +479,9 @@ class QuickJsRunner(
         editPlan: List<EditPlanSegment>
     ) {
         val engine = withContext(jsDispatcher) {
+            isRenderingFrame = false
+            initCutoutSeq.set(0)
+            frameCutoutSeq.set(0)
             updateClips(clips)
             synchronized(frameRingLock) {
                 frameRingKeys.clear()
@@ -548,79 +562,85 @@ class QuickJsRunner(
         val h = height.coerceAtLeast(2)
         val engine = withContext(jsDispatcher) {
             val q = ensureQuickJsReady()
+            isRenderingFrame = true
+            frameCutoutSeq.set(0)
             val surf = c2d.ensureSurface("__buf_main", w, h, preserveIfSameSize = true)
             surf.resetState()
             c2d.clearRect("__buf_main", 0f, 0f, w.toFloat(), h.toFloat())
             q
         }
 
-        evaluateAsyncJs(
-            engine,
-            """
-            const ctx = globalThis.__mainCtxObj;
-            const fn = globalThis.__activeExported.renderFrame;
-            const width = $w;
-            const height = $h;
-            const t = $tSec;
-            const duration = $durationSec;
-            const clips = globalThis.__activeClips || [];
-            const runtime = globalThis.runtime;
+        try {
+            evaluateAsyncJs(
+                engine,
+                """
+                const ctx = globalThis.__mainCtxObj;
+                const fn = globalThis.__activeExported.renderFrame;
+                const width = $w;
+                const height = $h;
+                const t = $tSec;
+                const duration = $durationSec;
+                const clips = globalThis.__activeClips || [];
+                const runtime = globalThis.runtime;
 
-            ctx.runtime = runtime;
-            ctx.getCanvas = runtime.getCanvas;
-            ctx.runShader = runtime.runShader;
-            ctx.getFrame = runtime.getFrame;
-            ctx.drawCover = runtime.drawCover;
-            ctx.segmentSubject = runtime.segmentSubject;
-            ctx.getSubjectMask = runtime.getSubjectMask;
-            ctx.segmentMediaPipe = runtime.segmentMediaPipe;
-            ctx.getMediaPipeMask = runtime.getMediaPipeMask;
-            ctx.segmentSam = runtime.segmentSam;
-            ctx.getSamMask = runtime.getSamMask;
-            ctx.detectBoxes = runtime.detectBoxes;
-            ctx.chromaKey = runtime.chromaKey;
-            ctx.seekClip = runtime.seekClip;
-            ctx.extractAudio = runtime.extractAudio;
+                ctx.runtime = runtime;
+                ctx.getCanvas = runtime.getCanvas;
+                ctx.runShader = runtime.runShader;
+                ctx.getFrame = runtime.getFrame;
+                ctx.drawCover = runtime.drawCover;
+                ctx.segmentSubject = runtime.segmentSubject;
+                ctx.getSubjectMask = runtime.getSubjectMask;
+                ctx.segmentMediaPipe = runtime.segmentMediaPipe;
+                ctx.getMediaPipeMask = runtime.getMediaPipeMask;
+                ctx.segmentSam = runtime.segmentSam;
+                ctx.getSamMask = runtime.getSamMask;
+                ctx.detectBoxes = runtime.detectBoxes;
+                ctx.chromaKey = runtime.chromaKey;
+                ctx.seekClip = runtime.seekClip;
+                ctx.extractAudio = runtime.extractAudio;
 
-            const fnStr = fn.toString();
-            const match = fnStr.slice(0, 320).match(/\(([^)]*)\)/);
-            const params = match ? match[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
-            let ret;
-            if (params.length > 0) {
-              const args = [];
-              for (let i = 0; i < params.length; i++) {
-                const p = params[i];
-                if (p.includes("clip") || p.includes("video") || p.includes("image") || p.includes("media") || p.includes("input") || p.includes("source")) {
-                  args.push(clips);
-                } else if (p === "ctx" || p.includes("context")) {
-                  args.push(ctx);
-                } else if (p === "runtime" || p.includes("helper")) {
-                  args.push(runtime);
-                } else if (p === "w" || p.includes("width")) {
-                  args.push(width);
-                } else if (p === "h" || p.includes("height")) {
-                  args.push(height);
-                } else if (p === "t" || p.includes("time") || p.includes("sec")) {
-                  args.push(t);
-                } else if (p.includes("progress")) {
-                  args.push(duration > 0 ? t / duration : 0);
-                } else if (p === "duration" || p.includes("total") || p.includes("dur")) {
-                  args.push(duration);
+                const fnStr = fn.toString();
+                const match = fnStr.slice(0, 320).match(/\(([^)]*)\)/);
+                const params = match ? match[1].split(",").map((s) => s.trim().toLowerCase()).filter(Boolean) : [];
+                let ret;
+                if (params.length > 0) {
+                  const args = [];
+                  for (let i = 0; i < params.length; i++) {
+                    const p = params[i];
+                    if (p.includes("clip") || p.includes("video") || p.includes("image") || p.includes("media") || p.includes("input") || p.includes("source")) {
+                      args.push(clips);
+                    } else if (p === "ctx" || p.includes("context")) {
+                      args.push(ctx);
+                    } else if (p === "runtime" || p.includes("helper")) {
+                      args.push(runtime);
+                    } else if (p === "w" || p.includes("width")) {
+                      args.push(width);
+                    } else if (p === "h" || p.includes("height")) {
+                      args.push(height);
+                    } else if (p === "t" || p.includes("time") || p.includes("sec")) {
+                      args.push(t);
+                    } else if (p.includes("progress")) {
+                      args.push(duration > 0 ? t / duration : 0);
+                    } else if (p === "duration" || p.includes("total") || p.includes("dur")) {
+                      args.push(duration);
+                    } else {
+                      const defaults = [ctx, width, height, t, duration, clips, runtime];
+                      args.push(defaults[i] !== undefined ? defaults[i] : null);
+                    }
+                  }
+                  ret = await fn(...args);
                 } else {
-                  const defaults = [ctx, width, height, t, duration, clips, runtime];
-                  args.push(defaults[i] !== undefined ? defaults[i] : null);
+                  ret = await fn(ctx, width, height, t, duration, clips, runtime);
                 }
-              }
-              ret = await fn(...args);
-            } else {
-              ret = await fn(ctx, width, height, t, duration, clips, runtime);
-            }
 
-            if (ret && ret.__handle && ret.__handle !== "__buf_main") {
-              ctx.drawImage(ret, 0, 0, width, height);
-            }
-            """.trimIndent()
-        )
+                if (ret && ret.__handle && ret.__handle !== "__buf_main") {
+                  ctx.drawImage(ret, 0, 0, width, height);
+                }
+                """.trimIndent()
+            )
+        } finally {
+            isRenderingFrame = false
+        }
 
         return withContext(jsDispatcher) {
             c2d.getBitmap("__buf_main") ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -775,23 +795,61 @@ class QuickJsRunner(
         clipSeekTimes.clear()
     }
 
-    private fun resolveSourceToBitmap(handleOrIdx: Any?): Bitmap? {
+    private fun parseFrameHandle(raw: String): Pair<Int, Float>? {
+        if (!raw.startsWith("__frame_")) return null
+        val parts = raw.removePrefix("__frame_").split("_")
+        if (parts.size != 2) return null
+        val clipIdx = parts[0].toIntOrNull() ?: return null
+        val qTick = parts[1].toIntOrNull() ?: return null
+        return clipIdx to (qTick / 24f)
+    }
+
+    private fun nextCutoutHandle(prefix: String, safeW: Int, safeH: Int): String {
+        return if (isRenderingFrame) {
+            "${prefix}_f${frameCutoutSeq.getAndIncrement()}_${safeW}x$safeH"
+        } else {
+            "${prefix}_i${initCutoutSeq.getAndIncrement()}_${safeW}x$safeH"
+        }
+    }
+
+    private fun resolveSourceBitmapInternal(handleOrIdx: Any?): ResolvedBitmap? {
         val raw = when (handleOrIdx) {
             is Number -> "__clip_${handleOrIdx.toInt()}"
             else -> handleOrIdx?.toString().orEmpty()
         }
-        c2d.getBitmap(raw)?.takeIf { !it.isRecycled }?.let { return it }
+        c2d.getBitmap(raw)?.takeIf { !it.isRecycled }?.let {
+            return ResolvedBitmap(it, isTemporary = false)
+        }
+        val framePair = parseFrameHandle(raw)
+        if (framePair != null) {
+            val (clipIdx, t) = framePair
+            val bmp = extractClipBitmapSync(clipIdx, t)?.takeIf { !it.isRecycled } ?: return null
+            val isTemp = clipsList.getOrNull(clipIdx)?.isImage != true
+            return ResolvedBitmap(bmp, isTemporary = isTemp)
+        }
         val clipIdx = parseClipIndex(raw) ?: return null
         val t = clipSeekTimes[clipIdx] ?: 0f
-        return extractClipBitmapSync(clipIdx, t)?.takeIf { !it.isRecycled }
+        val bmp = extractClipBitmapSync(clipIdx, t)?.takeIf { !it.isRecycled } ?: return null
+        val isTemp = clipsList.getOrNull(clipIdx)?.isImage != true
+        return ResolvedBitmap(bmp, isTemporary = isTemp)
     }
 
     private fun resolveSourceToHandleSync(raw: String): String? {
         if (c2d.getBitmap(raw)?.let { !it.isRecycled } == true) return raw
-        val clipIdx = parseClipIndex(raw) ?: return null
-        val t = clipSeekTimes[clipIdx] ?: 0f
-        val qTick = (t * 24f).roundToInt()
-        val key = "__frame_${clipIdx}_$qTick"
+        val framePair = parseFrameHandle(raw)
+        val clipIdx: Int
+        val t: Float
+        val key: String
+        if (framePair != null) {
+            clipIdx = framePair.first
+            t = framePair.second
+            key = raw
+        } else {
+            clipIdx = parseClipIndex(raw) ?: return null
+            t = clipSeekTimes[clipIdx] ?: 0f
+            val qTick = (t * 24f).roundToInt()
+            key = "__frame_${clipIdx}_$qTick"
+        }
         synchronized(frameRingLock) {
             if (c2d.getBitmap(key)?.let { !it.isRecycled } == true) return key
         }
@@ -893,9 +951,16 @@ class QuickJsRunner(
         zoom: Float
     ) {
         val dst = c2d.getSurface(ctxHandle) ?: return
-        val srcBmp = resolveSourceToBitmap(sourceHandleOrClipIndex) ?: return
-        if (srcBmp.isRecycled || width <= 0f || height <= 0f) return
-        smartSegmenter.drawCover(dst.canvas, srcBmp, x, y, width, height, zoom)
+        val resolved = resolveSourceBitmapInternal(sourceHandleOrClipIndex) ?: return
+        try {
+            val srcBmp = resolved.bitmap
+            if (srcBmp.isRecycled || width <= 0f || height <= 0f) return
+            smartSegmenter.drawCover(dst.canvas, srcBmp, x, y, width, height, zoom)
+        } finally {
+            if (resolved.isTemporary && !resolved.bitmap.isRecycled) {
+                resolved.bitmap.recycle()
+            }
+        }
     }
 
     override suspend fun runShader(
@@ -907,34 +972,64 @@ class QuickJsRunner(
         uniformsMap: Map<String, Any?>
     ): String {
         val resolvedTextures = mutableMapOf<String, Bitmap?>()
-        for ((texKey, handleOrIdx) in texturesMap) {
-            resolvedTextures[texKey] = resolveSourceToBitmap(handleOrIdx)
+        val tempBitmaps = mutableListOf<Bitmap>()
+        try {
+            for ((texKey, handleOrIdx) in texturesMap) {
+                val resolved = resolveSourceBitmapInternal(handleOrIdx)
+                resolvedTextures[texKey] = resolved?.bitmap
+                if (resolved != null && resolved.isTemporary) {
+                    tempBitmaps.add(resolved.bitmap)
+                }
+            }
+            val rendered = glShaderRunner.runShader(
+                key = key,
+                outW = outWidth,
+                outH = outHeight,
+                fragmentGlsl = fragmentGlsl,
+                texturesMap = resolvedTextures,
+                uniformsMap = uniformsMap
+            )
+            val handle = "__shader_$key"
+            c2d.putBitmapAsSurface(handle, rendered)
+            return handle
+        } finally {
+            for (tmp in tempBitmaps) {
+                if (!tmp.isRecycled) tmp.recycle()
+            }
         }
-        val rendered = glShaderRunner.runShader(
-            key = key,
-            outW = outWidth,
-            outH = outHeight,
-            fragmentGlsl = fragmentGlsl,
-            texturesMap = resolvedTextures,
-            uniformsMap = uniformsMap
-        )
-        val handle = "__shader_$key"
-        c2d.putBitmapAsSurface(handle, rendered)
-        return handle
     }
 
     override suspend fun detectBoxes(clipIndexOrHandle: Any?, timestampSec: Float): List<DetectedBox> {
         val raw = clipIndexOrHandle?.toString().orEmpty()
         val clipIdx = parseClipIndex(raw)
-        val bmp = if (clipIdx != null) extractClipBitmapSync(clipIdx, timestampSec) else resolveSourceToBitmap(raw)
-        return if (bmp != null && !bmp.isRecycled) smartSegmenter.detectBoxes(bmp) else emptyList()
+        val resolved = if (clipIdx != null) {
+            val bmp = extractClipBitmapSync(clipIdx, timestampSec)
+            bmp?.let { ResolvedBitmap(it, isTemporary = clipsList.getOrNull(clipIdx)?.isImage != true) }
+        } else {
+            resolveSourceBitmapInternal(raw)
+        } ?: return emptyList()
+
+        return try {
+            val bmp = resolved.bitmap
+            if (!bmp.isRecycled) smartSegmenter.detectBoxes(bmp) else emptyList()
+        } finally {
+            if (resolved.isTemporary && !resolved.bitmap.isRecycled) {
+                resolved.bitmap.recycle()
+            }
+        }
     }
 
     override suspend fun getMediaPipeMask(clipIndexOrHandle: Any?, width: Int, height: Int): MaskResult {
         val safeW = width.coerceAtLeast(2)
         val safeH = height.coerceAtLeast(2)
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        return smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
+        val resolved = resolveSourceBitmapInternal(clipIndexOrHandle)
+        val bmp = resolved?.bitmap ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val shouldRecycle = resolved == null || resolved.isTemporary
+        return try {
+            smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
+        } finally {
+            if (shouldRecycle && !bmp.isRecycled) bmp.recycle()
+        }
     }
 
     override suspend fun segmentMediaPipe(
@@ -947,12 +1042,18 @@ class QuickJsRunner(
     ): String {
         val safeW = width.coerceAtLeast(2)
         val safeH = height.coerceAtLeast(2)
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        val mask = smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
-        val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
-        val handle = "__seg_mp_${clipIndexOrHandle}_${safeW}x$safeH"
-        c2d.putBitmapAsSurface(handle, cutout)
-        return handle
+        val resolved = resolveSourceBitmapInternal(clipIndexOrHandle)
+        val bmp = resolved?.bitmap ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val shouldRecycle = resolved == null || resolved.isTemporary
+        return try {
+            val mask = smartSegmenter.getMediaPipeMask(bmp, safeW, safeH)
+            val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
+            val handle = nextCutoutHandle("__seg_mp", safeW, safeH)
+            c2d.putBitmapAsSurface(handle, cutout)
+            handle
+        } finally {
+            if (shouldRecycle && !bmp.isRecycled) bmp.recycle()
+        }
     }
 
     override suspend fun getSamMask(
@@ -963,8 +1064,14 @@ class QuickJsRunner(
     ): MaskResult {
         val safeW = width.coerceAtLeast(2)
         val safeH = height.coerceAtLeast(2)
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        return smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
+        val resolved = resolveSourceBitmapInternal(clipIndexOrHandle)
+        val bmp = resolved?.bitmap ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val shouldRecycle = resolved == null || resolved.isTemporary
+        return try {
+            smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
+        } finally {
+            if (shouldRecycle && !bmp.isRecycled) bmp.recycle()
+        }
     }
 
     override suspend fun segmentSam(
@@ -978,12 +1085,18 @@ class QuickJsRunner(
     ): String {
         val safeW = width.coerceAtLeast(2)
         val safeH = height.coerceAtLeast(2)
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        val mask = smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
-        val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
-        val handle = "__seg_sam_${clipIndexOrHandle}_${safeW}x$safeH"
-        c2d.putBitmapAsSurface(handle, cutout)
-        return handle
+        val resolved = resolveSourceBitmapInternal(clipIndexOrHandle)
+        val bmp = resolved?.bitmap ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val shouldRecycle = resolved == null || resolved.isTemporary
+        return try {
+            val mask = smartSegmenter.getSamMask(bmp, safeW, safeH, promptOpts)
+            val cutout = smartSegmenter.applyMaskToCutout(bmp, mask, feather, hardEdge, threshold)
+            val handle = nextCutoutHandle("__seg_sam", safeW, safeH)
+            c2d.putBitmapAsSurface(handle, cutout)
+            handle
+        } finally {
+            if (shouldRecycle && !bmp.isRecycled) bmp.recycle()
+        }
     }
 
     override fun chromaKey(
@@ -996,20 +1109,26 @@ class QuickJsRunner(
     ): String {
         val safeW = width.coerceAtLeast(2)
         val safeH = height.coerceAtLeast(2)
-        val bmp = resolveSourceToBitmap(clipIndexOrHandle) ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
-        val cutout = smartSegmenter.chromaKey(
-            source = bmp,
-            outW = safeW,
-            outH = safeH,
-            targetR = targetRgb.getOrElse(0) { 0 },
-            targetG = targetRgb.getOrElse(1) { 200 },
-            targetB = targetRgb.getOrElse(2) { 0 },
-            tolerance = tolerance,
-            feather = feather
-        )
-        val handle = "__chroma_${clipIndexOrHandle}_${safeW}x$safeH"
-        c2d.putBitmapAsSurface(handle, cutout)
-        return handle
+        val resolved = resolveSourceBitmapInternal(clipIndexOrHandle)
+        val bmp = resolved?.bitmap ?: Bitmap.createBitmap(safeW, safeH, Bitmap.Config.ARGB_8888)
+        val shouldRecycle = resolved == null || resolved.isTemporary
+        return try {
+            val cutout = smartSegmenter.chromaKey(
+                source = bmp,
+                outW = safeW,
+                outH = safeH,
+                targetR = targetRgb.getOrElse(0) { 0 },
+                targetG = targetRgb.getOrElse(1) { 200 },
+                targetB = targetRgb.getOrElse(2) { 0 },
+                tolerance = tolerance,
+                feather = feather
+            )
+            val handle = nextCutoutHandle("__chroma", safeW, safeH)
+            c2d.putBitmapAsSurface(handle, cutout)
+            handle
+        } finally {
+            if (shouldRecycle && !bmp.isRecycled) bmp.recycle()
+        }
     }
 
     override fun extractAudio(clipIndex: Int): PcmAudioBuffer? = clipsList.getOrNull(clipIndex)?.audioBuffer
