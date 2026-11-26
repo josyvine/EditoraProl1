@@ -30,6 +30,7 @@ import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 data class SamPointPrompt(
     val x: Float,
@@ -86,7 +87,7 @@ class SmartSegmenter(
         return runCatching {
             val baseOpts = BaseOptions.builder()
                 .setModelAssetPath(assetName)
-                .setDelegate(Delegate.GPU)
+                .setDelegate(Delegate.CPU)
                 .build()
             val opts = ImageSegmenter.ImageSegmenterOptions.builder()
                 .setBaseOptions(baseOpts)
@@ -95,24 +96,9 @@ class SmartSegmenter(
                 .setOutputCategoryMask(false)
                 .build()
             ImageSegmenter.createFromOptions(appContext, opts)
-        }.getOrElse { gpuErr ->
-            onLog("GPU delegate unavailable for $assetName (${gpuErr.message}); falling back to CPU.")
-            runCatching {
-                val baseOpts = BaseOptions.builder()
-                    .setModelAssetPath(assetName)
-                    .setDelegate(Delegate.CPU)
-                    .build()
-                val opts = ImageSegmenter.ImageSegmenterOptions.builder()
-                    .setBaseOptions(baseOpts)
-                    .setRunningMode(RunningMode.IMAGE)
-                    .setOutputConfidenceMasks(true)
-                    .setOutputCategoryMask(false)
-                    .build()
-                ImageSegmenter.createFromOptions(appContext, opts)
-            }.getOrElse { cpuErr ->
-                onLog("CPU delegate failed for $assetName (${cpuErr.message}).")
-                null
-            }
+        }.getOrElse { cpuErr ->
+            onLog("CPU delegate failed for $assetName (${cpuErr.message}).")
+            null
         }
     }
 
@@ -200,6 +186,13 @@ class SmartSegmenter(
         }
     }
 
+    private fun createCoverBitmap(source: Bitmap, w: Int, h: Int): Bitmap {
+        if (source.width == w && source.height == h) return source
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        drawCover(Canvas(out), source, 0f, 0f, w.toFloat(), h.toFloat(), 1f)
+        return out
+    }
+
     /**
      * Tier 1: Dual MediaPipe human segmentation (DeepLab-v3 class 15 + Selfie Multiclass inverted class 0).
      */
@@ -218,9 +211,7 @@ class SmartSegmenter(
                     return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
                 val startMs = SystemClock.elapsedRealtime()
-                val scaledIn = if (source.width != w || source.height != h) {
-                    Bitmap.createScaledBitmap(source, w, h, true)
-                } else source
+                val scaledIn = createCoverBitmap(source, w, h)
 
                 val mpImage = BitmapImageBuilder(scaledIn).build()
                 val fused = FloatArray(w * h)
@@ -319,7 +310,7 @@ class SmartSegmenter(
     }
 
     /**
-     * Tier 2 Step 2 & 3: EdgeSAM ONNX Encoder + Decoder (with zero-click EfficientDet handoff when prompt is empty).
+     * Tier 2 Step 2 & 3: EdgeSAM ONNX Encoder + Decoder (with subject-agnostic zero-click auto-prompting).
      */
     suspend fun getSamMask(
         source: Bitmap,
@@ -335,163 +326,230 @@ class SmartSegmenter(
         }
         ensureEdgeSamReady()
 
-        // Zero-click fallback: if neither boxes nor points provided, auto-detect highest-score box
-        val resolvedPrompts = if (promptOpts.boxes.isEmpty() && promptOpts.points.isEmpty()) {
-            val detected = detectBoxes(source)
-            val best = detected.maxByOrNull { it.score }
-            if (best != null) {
-                SamPromptOptions(boxes = listOf(best.box))
+        val hasExplicitPrompts = promptOpts.boxes.isNotEmpty() || promptOpts.points.isNotEmpty()
+        // When auto-prompting, align source using cover-crop to match applyMaskToCutout geometry 1:1
+        val workBmp = if (!hasExplicitPrompts) createCoverBitmap(source, w, h) else source
+
+        try {
+            // Zero-click auto-prompt: subject-agnostic salience box + dynamic center click,
+            // falling back to Tier-1 foreground centroid if detector finds no boxes.
+            val resolvedPrompts = if (!hasExplicitPrompts) {
+                val detected = detectBoxes(workBmp)
+                val best = detected.maxByOrNull { det ->
+                    val bw = det.box.getOrElse(2) { 0f }.coerceAtLeast(0f)
+                    val bh = det.box.getOrElse(3) { 0f }.coerceAtLeast(0f)
+                    val area = bw * bh
+                    val cx = det.box.getOrElse(0) { 0.5f } + bw * 0.5f
+                    val cy = det.box.getOrElse(1) { 0.5f } + bh * 0.5f
+                    val dx = cx - 0.5f
+                    val dy = cy - 0.5f
+                    val centerWeight = (1.0f - sqrt(dx * dx + dy * dy)).coerceIn(0.25f, 1.0f)
+                    det.score * sqrt(area.coerceAtLeast(0.0001f)) * centerWeight
+                }
+                if (best != null && best.box.size >= 4) {
+                    val cx = (best.box[0] + best.box[2] * 0.5f).coerceIn(0f, 1f)
+                    val cy = (best.box[1] + best.box[3] * 0.5f).coerceIn(0f, 1f)
+                    SamPromptOptions(
+                        boxes = listOf(best.box),
+                        points = listOf(SamPointPrompt(cx, cy, 1))
+                    )
+                } else {
+                    deriveAutoPromptFromMask(workBmp)
+                }
             } else {
-                SamPromptOptions(points = listOf(SamPointPrompt(0.5f, 0.5f, 1)))
-            }
-        } else {
-            promptOpts
-        }
-
-        inferMutex.withLock {
-            if (source.isRecycled || source.width <= 0 || source.height <= 0) {
-                onLog("Tier 2 EdgeSAM skipped: source bitmap recycled before inference.")
-                return@withLock MaskResult(w, h, FloatArray(w * h))
-            }
-            val env = ortEnv
-            val enc = samEncoderSession
-            val dec = samDecoderSession
-            if (env == null || enc == null || dec == null) {
-                onLog("EdgeSAM ONNX sessions unavailable; falling back to Tier 1 mask.")
-                return@withLock MaskResult(w, h, FloatArray(w * h))
+                promptOpts
             }
 
-            // 1. Run or reuse 1024x1024 EdgeSAM encoder embedding
-            val frameHash = computeBitmapHash(source)
-            val embData: FloatArray
-            val embShape: LongArray
-
-            if (frameHash == lastEmbeddingHash && lastEmbeddingData != null && lastEmbeddingShape != null) {
-                embData = lastEmbeddingData!!
-                embShape = lastEmbeddingShape!!
-            } else {
-                val input1024 = Bitmap.createScaledBitmap(source, 1024, 1024, true)
-                val pixels = IntArray(1024 * 1024)
-                input1024.getPixels(pixels, 0, 1024, 0, 0, 1024, 1024)
-                if (input1024 !== source) input1024.recycle()
-
-                val tensorData = FloatArray(3 * 1024 * 1024)
-                val plane = 1024 * 1024
-                for (i in 0 until plane) {
-                    val px = pixels[i]
-                    val r = ((px shr 16) and 0xFF).toFloat()
-                    val g = ((px shr 8) and 0xFF).toFloat()
-                    val b = (px and 0xFF).toFloat()
-                    tensorData[i] = (r - 123.675f) / 58.395f
-                    tensorData[plane + i] = (g - 116.28f) / 57.12f
-                    tensorData[2 * plane + i] = (b - 103.53f) / 57.375f
+            inferMutex.withLock {
+                if (workBmp.isRecycled || workBmp.width <= 0 || workBmp.height <= 0) {
+                    onLog("Tier 2 EdgeSAM skipped: source bitmap recycled before inference.")
+                    return@withLock MaskResult(w, h, FloatArray(w * h))
+                }
+                val env = ortEnv
+                val enc = samEncoderSession
+                val dec = samDecoderSession
+                if (env == null || enc == null || dec == null) {
+                    onLog("EdgeSAM ONNX sessions unavailable; falling back to Tier 1 mask.")
+                    return@withLock MaskResult(w, h, FloatArray(w * h))
                 }
 
-                val encInputName = enc.inputNames.first()
-                OnnxTensor.createTensor(env, FloatBuffer.wrap(tensorData), longArrayOf(1, 3, 1024, 1024)).use { inpTensor ->
-                    enc.run(mapOf(encInputName to inpTensor)).use { encRes ->
-                        val outTensor = encRes[0] as OnnxTensor
-                        embShape = outTensor.info.shape
-                        val fb = outTensor.floatBuffer
-                        embData = FloatArray(fb.remaining())
-                        fb.get(embData)
-                        lastEmbeddingHash = frameHash
-                        lastEmbeddingData = embData
-                        lastEmbeddingShape = embShape
+                // 1. Run or reuse 1024x1024 EdgeSAM encoder embedding
+                val frameHash = computeBitmapHash(workBmp)
+                val embData: FloatArray
+                val embShape: LongArray
+
+                if (frameHash == lastEmbeddingHash && lastEmbeddingData != null && lastEmbeddingShape != null) {
+                    embData = lastEmbeddingData!!
+                    embShape = lastEmbeddingShape!!
+                } else {
+                    val input1024 = Bitmap.createScaledBitmap(workBmp, 1024, 1024, true)
+                    val pixels = IntArray(1024 * 1024)
+                    input1024.getPixels(pixels, 0, 1024, 0, 0, 1024, 1024)
+                    if (input1024 !== workBmp) input1024.recycle()
+
+                    val tensorData = FloatArray(3 * 1024 * 1024)
+                    val plane = 1024 * 1024
+                    for (i in 0 until plane) {
+                        val px = pixels[i]
+                        val r = ((px shr 16) and 0xFF).toFloat()
+                        val g = ((px shr 8) and 0xFF).toFloat()
+                        val b = (px and 0xFF).toFloat()
+                        tensorData[i] = (r - 123.675f) / 58.395f
+                        tensorData[plane + i] = (g - 116.28f) / 57.12f
+                        tensorData[2 * plane + i] = (b - 103.53f) / 57.375f
                     }
-                }
-            }
 
-            // 2. Map boxes (labels 2.0 top-left, 3.0 bottom-right) & points into 1024-space
-            val coordsList = mutableListOf<Float>()
-            val labelsList = mutableListOf<Float>()
-
-            for (box in resolvedPrompts.boxes) {
-                if (box.size >= 4) {
-                    val x0 = (box[0].coerceIn(0f, 1f)) * 1024f
-                    val y0 = (box[1].coerceIn(0f, 1f)) * 1024f
-                    val x1 = ((box[0] + box[2]).coerceIn(0f, 1f)) * 1024f
-                    val y1 = ((box[1] + box[3]).coerceIn(0f, 1f)) * 1024f
-                    coordsList.add(x0); coordsList.add(y0); labelsList.add(2.0f)
-                    coordsList.add(x1); coordsList.add(y1); labelsList.add(3.0f)
-                }
-            }
-            for (pt in resolvedPrompts.points) {
-                coordsList.add(pt.x.coerceIn(0f, 1f) * 1024f)
-                coordsList.add(pt.y.coerceIn(0f, 1f) * 1024f)
-                labelsList.add(pt.label.toFloat())
-            }
-            if (resolvedPrompts.boxes.isEmpty() && resolvedPrompts.points.isNotEmpty()) {
-                // Standard SAM padding point when only point prompts are used
-                coordsList.add(0f); coordsList.add(0f); labelsList.add(-1f)
-            }
-
-            val numPts = labelsList.size.coerceAtLeast(1)
-            val coordsArr = coordsList.toFloatArray()
-            val labelsArr = labelsList.toFloatArray()
-
-            val decInputs = mutableMapOf<String, OnnxTensor>()
-            val createdTensors = mutableListOf<OnnxTensor>()
-            try {
-                for (name in dec.inputNames) {
-                    val tensor = when (name) {
-                        "image_embeddings" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(embData), embShape)
-                        "point_coords" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(coordsArr), longArrayOf(1, numPts.toLong(), 2))
-                        "point_labels" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(labelsArr), longArrayOf(1, numPts.toLong()))
-                        "mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(FloatArray(256 * 256)), longArrayOf(1, 1, 256, 256))
-                        "has_mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(0f)), longArrayOf(1))
-                        "orig_im_size" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(h.toFloat(), w.toFloat())), longArrayOf(2))
-                        else -> null
-                    }
-                    if (tensor != null) {
-                        decInputs[name] = tensor
-                        createdTensors.add(tensor)
+                    val encInputName = enc.inputNames.first()
+                    OnnxTensor.createTensor(env, FloatBuffer.wrap(tensorData), longArrayOf(1, 3, 1024, 1024)).use { inpTensor ->
+                        enc.run(mapOf(encInputName to inpTensor)).use { encRes ->
+                            val outTensor = encRes[0] as OnnxTensor
+                            embShape = outTensor.info.shape
+                            val fb = outTensor.floatBuffer
+                            embData = FloatArray(fb.remaining())
+                            fb.get(embData)
+                            lastEmbeddingHash = frameHash
+                            lastEmbeddingData = embData
+                            lastEmbeddingShape = embShape
+                        }
                     }
                 }
 
-                dec.run(decInputs).use { decRes ->
-                    // Find best mask index from iou_predictions / scores if present
-                    var bestMaskIdx = 0
-                    var maskTensor: OnnxTensor? = null
-                    for ((idx, entry) in decRes.withIndex()) {
-                        val t = entry.value as? OnnxTensor ?: continue
-                        val shape = t.info.shape
-                        if (shape.size == 2 && shape[0] == 1L && shape[1] in 1L..4L) {
-                            val scores = FloatArray(shape[1].toInt())
-                            t.floatBuffer.get(scores)
-                            bestMaskIdx = scores.indices.maxByOrNull { scores[it] } ?: 0
-                        } else if (shape.size == 4 && maskTensor == null) {
-                            maskTensor = t
-                        } else if (idx == 0 && maskTensor == null && shape.size == 4) {
-                            maskTensor = t
+                // 2. Map boxes (labels 2.0 top-left, 3.0 bottom-right) & points into 1024-space
+                val coordsList = mutableListOf<Float>()
+                val labelsList = mutableListOf<Float>()
+
+                for (box in resolvedPrompts.boxes) {
+                    if (box.size >= 4) {
+                        val x0 = (box[0].coerceIn(0f, 1f)) * 1024f
+                        val y0 = (box[1].coerceIn(0f, 1f)) * 1024f
+                        val x1 = ((box[0] + box[2]).coerceIn(0f, 1f)) * 1024f
+                        val y1 = ((box[1] + box[3]).coerceIn(0f, 1f)) * 1024f
+                        coordsList.add(x0); coordsList.add(y0); labelsList.add(2.0f)
+                        coordsList.add(x1); coordsList.add(y1); labelsList.add(3.0f)
+                    }
+                }
+                for (pt in resolvedPrompts.points) {
+                    coordsList.add(pt.x.coerceIn(0f, 1f) * 1024f)
+                    coordsList.add(pt.y.coerceIn(0f, 1f) * 1024f)
+                    labelsList.add(pt.label.toFloat())
+                }
+                if (resolvedPrompts.boxes.isEmpty() && resolvedPrompts.points.isNotEmpty()) {
+                    // Standard SAM padding point when only point prompts are used
+                    coordsList.add(0f); coordsList.add(0f); labelsList.add(-1f)
+                }
+
+                val numPts = labelsList.size.coerceAtLeast(1)
+                val coordsArr = coordsList.toFloatArray()
+                val labelsArr = labelsList.toFloatArray()
+
+                val decInputs = mutableMapOf<String, OnnxTensor>()
+                val createdTensors = mutableListOf<OnnxTensor>()
+                try {
+                    for (name in dec.inputNames) {
+                        val tensor = when (name) {
+                            "image_embeddings" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(embData), embShape)
+                            "point_coords" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(coordsArr), longArrayOf(1, numPts.toLong(), 2))
+                            "point_labels" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(labelsArr), longArrayOf(1, numPts.toLong()))
+                            "mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(FloatArray(256 * 256)), longArrayOf(1, 1, 256, 256))
+                            "has_mask_input" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(0f)), longArrayOf(1))
+                            "orig_im_size" -> OnnxTensor.createTensor(env, FloatBuffer.wrap(floatArrayOf(h.toFloat(), w.toFloat())), longArrayOf(2))
+                            else -> null
+                        }
+                        if (tensor != null) {
+                            decInputs[name] = tensor
+                            createdTensors.add(tensor)
                         }
                     }
 
-                    val chosenMask = maskTensor ?: (decRes[0] as OnnxTensor)
-                    val mShape = chosenMask.info.shape // [1, C, MH, MW]
-                    val numMasks = mShape[1].toInt().coerceAtLeast(1)
-                    val mh = mShape[2].toInt().coerceAtLeast(1)
-                    val mw = mShape[3].toInt().coerceAtLeast(1)
-                    val planeSize = mh * mw
-                    val pickedIdx = bestMaskIdx.coerceIn(0, numMasks - 1)
+                    dec.run(decInputs).use { decRes ->
+                        // Find best mask index from iou_predictions / scores if present
+                        var bestMaskIdx = 0
+                        var maskTensor: OnnxTensor? = null
+                        for ((idx, entry) in decRes.withIndex()) {
+                            val t = entry.value as? OnnxTensor ?: continue
+                            val shape = t.info.shape
+                            if (shape.size == 2 && shape[0] == 1L && shape[1] in 1L..4L) {
+                                val scores = FloatArray(shape[1].toInt())
+                                t.floatBuffer.get(scores)
+                                bestMaskIdx = scores.indices.maxByOrNull { scores[it] } ?: 0
+                            } else if (shape.size == 4 && maskTensor == null) {
+                                maskTensor = t
+                            } else if (idx == 0 && maskTensor == null && shape.size == 4) {
+                                maskTensor = t
+                            }
+                        }
 
-                    val fb = chosenMask.floatBuffer
-                    val allLogits = FloatArray(fb.remaining())
-                    fb.get(allLogits)
+                        val chosenMask = maskTensor ?: (decRes[0] as OnnxTensor)
+                        val mShape = chosenMask.info.shape // [1, C, MH, MW]
+                        val numMasks = mShape[1].toInt().coerceAtLeast(1)
+                        val mh = mShape[2].toInt().coerceAtLeast(1)
+                        val mw = mShape[3].toInt().coerceAtLeast(1)
+                        val planeSize = mh * mw
+                        val pickedIdx = bestMaskIdx.coerceIn(0, numMasks - 1)
 
-                    val rawMask = FloatArray(planeSize)
-                    val offset = pickedIdx * planeSize
-                    for (i in 0 until planeSize) {
-                        val logit = allLogits.getOrElse(offset + i) { -10f }
-                        rawMask[i] = (1.0f / (1.0f + exp(-logit))).coerceIn(0f, 1f)
+                        val fb = chosenMask.floatBuffer
+                        val allLogits = FloatArray(fb.remaining())
+                        fb.get(allLogits)
+
+                        val rawMask = FloatArray(planeSize)
+                        val offset = pickedIdx * planeSize
+                        for (i in 0 until planeSize) {
+                            val logit = allLogits.getOrElse(offset + i) { -10f }
+                            rawMask[i] = (1.0f / (1.0f + exp(-logit))).coerceIn(0f, 1f)
+                        }
+
+                        val resized = resizeMaskBilinear(rawMask, mw, mh, w, h)
+                        MaskResult(w, h, resized)
                     }
-
-                    val resized = resizeMaskBilinear(rawMask, mw, mh, w, h)
-                    MaskResult(w, h, resized)
+                } finally {
+                    createdTensors.forEach { runCatching { it.close() } }
                 }
-            } finally {
-                createdTensors.forEach { runCatching { it.close() } }
             }
+        } finally {
+            if (workBmp !== source) workBmp.recycle()
+        }
+    }
+
+    private suspend fun deriveAutoPromptFromMask(source: Bitmap): SamPromptOptions {
+        val probeW = 128
+        val probeH = 128
+        val probe = getMediaPipeMask(source, probeW, probeH)
+        var minX = probeW
+        var minY = probeH
+        var maxX = -1
+        var maxY = -1
+        var sumX = 0f
+        var sumY = 0f
+        var count = 0
+
+        for (y in 0 until probeH) {
+            val row = y * probeW
+            for (x in 0 until probeW) {
+                if (probe.data[row + x] >= 0.45f) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                    sumX += x
+                    sumY += y
+                    count++
+                }
+            }
+        }
+
+        return if (count >= 16 && maxX > minX && maxY > minY) {
+            val bx = (minX.toFloat() / probeW).coerceIn(0f, 1f)
+            val by = (minY.toFloat() / probeH).coerceIn(0f, 1f)
+            val bw = ((maxX - minX + 1).toFloat() / probeW).coerceIn(0.02f, 1f - bx)
+            val bh = ((maxY - minY + 1).toFloat() / probeH).coerceIn(0.02f, 1f - by)
+            val cx = (sumX / count / probeW).coerceIn(0f, 1f)
+            val cy = (sumY / count / probeH).coerceIn(0f, 1f)
+            SamPromptOptions(
+                boxes = listOf(listOf(bx, by, bw, bh)),
+                points = listOf(SamPointPrompt(cx, cy, 1))
+            )
+        } else {
+            SamPromptOptions(points = listOf(SamPointPrompt(0.5f, 0.5f, 1)))
         }
     }
 
@@ -583,7 +641,7 @@ class SmartSegmenter(
             val dr = (r - targetR).toFloat()
             val dg = (g - targetG).toFloat()
             val db = (b - targetB).toFloat()
-            val dist = kotlin.math.sqrt(dr * dr + dg * dg + db * db)
+            val dist = sqrt(dr * dr + dg * dg + db * db)
             val newA = when {
                 dist < tolerance -> 0
                 dist < tolerance + safeFeather -> (a * ((dist - tolerance) / safeFeather)).roundToInt().coerceIn(0, 255)
